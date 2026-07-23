@@ -1,0 +1,31 @@
+# build output
+/build/
+/out/
+*.o
+*.obj
+*.elf
+*.bin
+*.exe
+*.pdb
+
+# generated
+/**/generated/
+runtime_blob.h
+
+# test debug
+*.stackdump
+
+# editor / os
+.vscode/
+.idea/
+*.user
+Thumbs.db
+.DS_Store
+
+# python tooling
+__pycache__/
+*.pyc
+.venv/
+
+# text files
+look/
