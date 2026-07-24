@@ -306,6 +306,21 @@ karity_vm_thunk_fpreg_offset:           /* SEH: this instruction's own end offse
                                            links the symbol itself (BSS, zero-initialized) via
                                            karity_anti_debug_hosted, so this is a no-op there too -- see
                                            runtime/CMakeLists.txt. */
+    xor     r10, [rip + karity_integrity_taint] /* Fold the live self-integrity checksum (include/
+                                           karity/integrity.h) into the same key, right after the anti-
+                                           debug taint above. Unlike that taint (0 when clean), this is
+                                           the DETERMINISTIC hash of the generated interpreter's own live
+                                           bytes: at protect time the injector stored this site's key as
+                                           (real_seed ^ H_expected), so when the interpreter is pristine
+                                           the live hash equals H_expected and this XOR cancels it back to
+                                           real_seed; the moment any hashed byte is patched, the live hash
+                                           differs and every subsequent VM entry decrypts with the wrong
+                                           key and runs garbage -- far from wherever the patch is. Like
+                                           karity_anti_debug_taint this is a plain global (one aligned load
+                                           on the hot path; the hashing runs at karity_integrity_init and
+                                           on a background watchdog, not here) and stays 0 in BSS when the
+                                           feature is off (binary protected without --anti-tamper, or a
+                                           hosted test), making this XOR a no-op there. */
     mov     [rbx+264], r10             /* bytecode_key_seed */
 
     lea     rax, [rbx + KARITY_VM_SLOT_SIZE] /* private VM operand stack, 4 KiB, right after vmctx

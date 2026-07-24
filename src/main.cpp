@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "inject/injector.h"
+#include "karity/anti_debug.h"
 #include "pe/pe_image.h"
 
 int main(int argc, char **argv)
@@ -12,6 +13,7 @@ int main(int argc, char **argv)
     if (argc < 2) {
         std::fprintf(stderr,
             "usage: %s <input.exe> [-o <output.exe>] [--entry <hex-rva>]... [--no-oep] "
+            "[--anti-debug] [--anti-vm] [--anti-sandbox] [--anti-tamper] "
             "[--anti-ida] [--anti-ida-rva <hex-rva>] [--anti-ida-size <hex-size>]\n",
             argv[0]);
         return 2;
@@ -21,6 +23,8 @@ int main(int argc, char **argv)
     std::string out_path = in_path + ".karity.exe";
     std::vector<uint32_t> extra_entries;
     bool skip_oep = false;
+    uint32_t anti_analysis = 0;
+    bool anti_tamper = false;
     bool anti_ida = false;
     bool anti_ida_rva_set = false;
     uint32_t anti_ida_rva = 0;
@@ -29,6 +33,35 @@ int main(int argc, char **argv)
         std::string arg = argv[i];
         if (arg == "-o" && i + 1 < argc) {
             out_path = argv[++i];
+        } else if (arg == "--anti-debug") {
+            // Fold debugger-presence checks into the bytecode decryption key
+            // (see include/karity/anti_debug.h). Opt-in: a real end user is
+            // essentially never being debugged, but this is off by default
+            // alongside --anti-vm so the two false-positive-prone categories
+            // stay explicit. Anti-sandbox runs regardless.
+            anti_analysis |= KARITY_ANTI_ANALYSIS_DEBUG;
+        } else if (arg == "--anti-vm") {
+            // Fold hypervisor-presence checks into the same key. Opt-in
+            // specifically because a large, legitimate fraction of real
+            // deployments run inside a VM (cloud/VDI/Parallels/CI) and would
+            // otherwise be corrupted -- see include/karity/anti_debug.h.
+            anti_analysis |= KARITY_ANTI_ANALYSIS_VM;
+        } else if (arg == "--anti-sandbox") {
+            // Fold automated-sandbox heuristics (Sandboxie DLL, low CPU/RAM,
+            // fresh boot, hooked Sleep) into the same key. Opt-in like the
+            // others -- its Sleep-skew probe also costs ~300ms at startup, so
+            // it shouldn't be forced on. See include/karity/anti_debug.h.
+            anti_analysis |= KARITY_ANTI_ANALYSIS_SANDBOX;
+        } else if (arg == "--anti-tamper") {
+            // Self-integrity: hash the generated interpreter and fold that
+            // checksum into every site's bytecode decryption key, so patching
+            // the interpreter corrupts decryption rather than tripping a
+            // defeatable branch (see include/karity/integrity.h). Unlike the
+            // anti-analysis categories this has no legitimate-use false
+            // positives -- the image's own bytes are identical for every user
+            // -- so it's safe to leave on, but kept an explicit opt-in for
+            // uniformity with the others.
+            anti_tamper = true;
         } else if (arg == "--entry" && i + 1 < argc) {
             // Additional virtualization site, beyond OEP (unless --no-oep) --
             // an RVA the caller already knows points at a liftable function
@@ -56,7 +89,7 @@ int main(int argc, char **argv)
 
     try {
         auto img = karity::PeImage::load(in_path);
-        karity::inject_vm_at_entry(img, extra_entries, skip_oep);
+        karity::inject_vm_at_entry(img, extra_entries, skip_oep, anti_analysis, anti_tamper);
         if (anti_ida) {
             const uint32_t rva = anti_ida_rva_set ? anti_ida_rva : img.entry_point_rva();
             img.spoof_iat_directory(rva, anti_ida_size);

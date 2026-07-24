@@ -21,11 +21,22 @@
 extern "C" {
 #endif
 
-/* Runs every hypervisor-detection technique once and returns their combined
- * contribution (0 if nothing looked virtualized, nonzero otherwise -- see
- * include/karity/anti_debug.h for why only the zero-ness is ever meaningful
- * anywhere). Safe to call from a hosted build too -- see
- * runtime/CMakeLists.txt's karity_anti_vm_hosted. */
+/* Side-effect-free hypervisor checks (CPUID present-bit, vendor leaf, CPUID
+ * timing) -- the caller (runtime/anti_debug.c) runs these unconditionally
+ * and masks the result by whether the VM category is enabled, so there's no
+ * single "skip VM detection" branch. Returns the combined taint (0 if
+ * nothing looked virtualized). */
+uint64_t karity_anti_vm_scan_passive(void);
+
+/* The VMware backdoor-port probe, which raises a self-caught first-chance
+ * exception a debugger would observe -- so the caller only runs this when
+ * the VM category is actually enabled (see runtime/anti_debug.c). */
+uint64_t karity_anti_vm_scan_active(void);
+
+/* Passive | active, for the standalone hosted reporter tests/test_anti_vm.c
+ * (see include/karity/anti_debug.h for why only zero-ness is meaningful).
+ * Safe to call from a hosted build -- see runtime/CMakeLists.txt's
+ * karity_anti_debug_hosted (which bundles anti_vm.c). */
 uint64_t karity_anti_vm_scan(void);
 
 #ifdef __cplusplus

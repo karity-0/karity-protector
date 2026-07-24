@@ -21,6 +21,8 @@ add_executable(karity_runtime_image
     anti_vm.c
     anti_sandbox.c
     anti_debug_thunk.S
+    integrity.c
+    integrity_thunk.S
 )
 
 target_include_directories(karity_runtime_image PRIVATE
@@ -52,6 +54,12 @@ target_link_options(karity_runtime_image PRIVATE
                                   # karity_anti_debug_init, so that (and the
                                   # karity_anti_debug_taint global
                                   # runtime/vm_thunk.S also references
+                                  # directly) don't need their own -u.
+    -Wl,-u,karity_integrity_install_thunk # same reasoning again -- only the
+                                  # injector calls this one, by offset; it in
+                                  # turn genuinely calls karity_integrity_init,
+                                  # so that (and the karity_integrity_taint
+                                  # global runtime/vm_thunk.S references
                                   # directly) don't need their own -u.
     -Wl,--image-base=0x10000000
     -Wl,--file-alignment=16
@@ -85,7 +93,7 @@ add_custom_command(
             -D "EXE_FILE=$<TARGET_FILE:karity_runtime_image>"
             -D "BIN_FILE=${KARITY_RUNTIME_BLOB_BIN}"
             -D "OUT_FILE=${KARITY_RUNTIME_BLOB_HEADER}"
-            -D "SYMBOLS=karity_vm_thunk:KARITY_RUNTIME_ENTRY_OFFSET;karity_vm_thunk_fpreg_offset:KARITY_RUNTIME_THUNK_FPREG_OFFSET;karity_vm_thunk_prolog_end:KARITY_RUNTIME_THUNK_PROLOG_END_OFFSET;karity_vm_thunk_end:KARITY_RUNTIME_THUNK_END_OFFSET;karity_interp_rel32:KARITY_RUNTIME_INTERP_REL32_OFFSET;karity_vm_native_call:KARITY_RUNTIME_NATIVE_CALL_OFFSET;karity_vm_native_call_prolog_end:KARITY_RUNTIME_NATIVE_CALL_PROLOG_END_OFFSET;karity_vm_native_call_end:KARITY_RUNTIME_NATIVE_CALL_END_OFFSET;karity_nanomite_install_thunk:KARITY_RUNTIME_NANOMITE_THUNK_OFFSET;karity_anti_debug_install_thunk:KARITY_RUNTIME_ANTIDEBUG_THUNK_OFFSET"
+            -D "SYMBOLS=karity_vm_thunk:KARITY_RUNTIME_ENTRY_OFFSET;karity_vm_thunk_fpreg_offset:KARITY_RUNTIME_THUNK_FPREG_OFFSET;karity_vm_thunk_prolog_end:KARITY_RUNTIME_THUNK_PROLOG_END_OFFSET;karity_vm_thunk_end:KARITY_RUNTIME_THUNK_END_OFFSET;karity_interp_rel32:KARITY_RUNTIME_INTERP_REL32_OFFSET;karity_vm_native_call:KARITY_RUNTIME_NATIVE_CALL_OFFSET;karity_vm_native_call_prolog_end:KARITY_RUNTIME_NATIVE_CALL_PROLOG_END_OFFSET;karity_vm_native_call_end:KARITY_RUNTIME_NATIVE_CALL_END_OFFSET;karity_nanomite_install_thunk:KARITY_RUNTIME_NANOMITE_THUNK_OFFSET;karity_anti_debug_install_thunk:KARITY_RUNTIME_ANTIDEBUG_THUNK_OFFSET;karity_integrity_install_thunk:KARITY_RUNTIME_INTEGRITY_THUNK_OFFSET"
             -D "NM_EXECUTABLE=${KARITY_NM}"
             -D "OBJDUMP_EXECUTABLE=${KARITY_OBJDUMP}"
             -P "${CMAKE_SOURCE_DIR}/cmake/GenerateBlobHeader.cmake"
@@ -136,6 +144,15 @@ target_include_directories(karity_nanomite_hosted PUBLIC
 # without all three contributing to it.
 add_library(karity_anti_debug_hosted STATIC anti_debug.c anti_vm.c anti_sandbox.c api_resolve.c)
 target_include_directories(karity_anti_debug_hosted PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+# Hosted build of the self-integrity checksum, used by tests/ -- same source
+# as the freestanding blob, so the live-hash side can be checked against the
+# host encoder's protect-time hash (they share include/karity/integrity.h).
+add_library(karity_integrity_hosted STATIC integrity.c api_resolve.c)
+target_include_directories(karity_integrity_hosted PUBLIC
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}
 )

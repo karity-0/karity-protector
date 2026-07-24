@@ -82,11 +82,12 @@ add_executable(karity_test_vm_thunk
     test_thunk.S
     ${CMAKE_SOURCE_DIR}/runtime/vm_thunk.S
 )
-# vm_thunk.S references karity_anti_debug_taint directly (see runtime/
-# anti_debug.c and its own comment in vm_thunk.S) -- link the hosted build
-# so that symbol resolves; test_thunk_main.c also exercises it directly
-# (test_thunk_taint) to validate the XOR-into-bytecode_key_seed wiring.
-target_link_libraries(karity_test_vm_thunk PRIVATE karity_vm_interp_hosted karity_anti_debug_hosted)
+# vm_thunk.S references karity_anti_debug_taint and karity_integrity_taint
+# directly (see runtime/anti_debug.c, runtime/integrity.c, and its own comments
+# in vm_thunk.S) -- link the hosted builds so those symbols resolve;
+# test_thunk_main.c also exercises the taint XOR-into-bytecode_key_seed wiring
+# directly (test_thunk_taint).
+target_link_libraries(karity_test_vm_thunk PRIVATE karity_vm_interp_hosted karity_anti_debug_hosted karity_integrity_hosted)
 add_test(NAME vm_thunk COMMAND karity_test_vm_thunk)
 
 # Import-free WinAPI resolver (PEB walk + hand-parsed export directory),
@@ -115,6 +116,15 @@ add_test(NAME nanomite COMMAND karity_test_nanomite)
 add_executable(karity_test_anti_debug test_anti_debug.c)
 target_link_libraries(karity_test_anti_debug PRIVATE karity_anti_debug_hosted)
 add_test(NAME anti_debug COMMAND karity_test_anti_debug)
+
+# Self-integrity checksum (include/karity/integrity.h + runtime/integrity.c):
+# validates the pure hash (determinism, len==0 -> 0, single-bit avalanche) and
+# that runtime/integrity.c publishes bit-identically to the host header, so a
+# clean run's checksum-as-key XOR cancels. See include/karity/integrity.h.
+add_executable(karity_test_integrity test_integrity.c)
+target_include_directories(karity_test_integrity PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(karity_test_integrity PRIVATE karity_integrity_hosted)
+add_test(NAME integrity COMMAND karity_test_integrity)
 
 # Reports (doesn't assert -- hypervisor presence isn't poke-able the way
 # PEB fields are) what runtime/anti_vm.c sees on the machine running ctest.

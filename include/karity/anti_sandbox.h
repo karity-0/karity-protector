@@ -17,15 +17,23 @@
 extern "C" {
 #endif
 
-/* Runs every sandbox/automated-analysis-environment heuristic once and
- * returns their combined contribution (0 if the environment looks like an
- * ordinary, real user machine, nonzero otherwise -- see
- * include/karity/anti_debug.h for why only the zero-ness is ever
- * meaningful anywhere). Blocks for ~300ms (the Sleep-skew probe below) --
- * called once at process start and periodically by the watchdog, never on
- * the VM-entry hot path itself, so this is an acceptable, deliberate cost.
- * Safe to call from a hosted build too -- see
- * runtime/CMakeLists.txt's karity_anti_sandbox_hosted. */
+/* Cheap, side-effect-free heuristics (Sandboxie DLL, low CPU/RAM, short
+ * uptime) -- the caller (runtime/anti_debug.c) runs these unconditionally
+ * and masks the result by whether the sandbox category is enabled, so
+ * there's no single "skip sandbox detection" branch. Returns the combined
+ * taint (0 if the environment looks like an ordinary real machine). */
+uint64_t karity_anti_sandbox_scan_passive(void);
+
+/* The Sleep-skew probe, which blocks ~300ms of real time -- the caller only
+ * runs it when the sandbox category is enabled so an --anti-sandbox-off
+ * binary doesn't stall at startup or on every watchdog tick. */
+uint64_t karity_anti_sandbox_scan_active(void);
+
+/* Passive | active, for standalone hosted callers/tests (see
+ * include/karity/anti_debug.h for why only zero-ness is meaningful). Blocks
+ * ~300ms via the active probe. Safe to call from a hosted build -- see
+ * runtime/CMakeLists.txt's karity_anti_debug_hosted (which bundles
+ * anti_sandbox.c). */
 uint64_t karity_anti_sandbox_scan(void);
 
 #ifdef __cplusplus

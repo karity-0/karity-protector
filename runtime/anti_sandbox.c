@@ -6,6 +6,14 @@
  * feeding one funnel, not a separate mechanism). Same freestanding
  * discipline as the rest of this runtime: no windows.h, structs accessed
  * by raw documented offset, WinAPI resolved by name hash.
+ *
+ * Each check returns its taint contribution directly (constant-or-0),
+ * computed branchlessly, like runtime/anti_debug.c's checks -- see that
+ * file's karity_ad_mask_nz comment. Split into a passive scan (cheap, no
+ * observable side effects -- Sandboxie DLL, CPU/RAM/uptime quotas) run
+ * unconditionally and masked, and an active scan (the ~300ms Sleep-skew
+ * probe) the caller only runs when the sandbox category is enabled so an
+ * --anti-sandbox-off binary doesn't stall at startup.
  */
 #include "karity/anti_sandbox.h"
 
@@ -30,14 +38,22 @@ typedef int (*karity_pfn_global_memory_status_ex)(void *info);
 typedef uint64_t (*karity_pfn_get_tick_count_64)(void);
 typedef void (*karity_pfn_sleep)(uint32_t ms);
 
+/* Branchless boolean->mask, duplicated from runtime/anti_debug.c (same
+ * per-file hand-rolling discipline as the hashes above) -- ~0 if v!=0 else
+ * 0. See anti_debug.c's karity_ad_mask_nz for the rationale. */
+static uint64_t karity_asb_mask_nz(uint64_t v)
+{
+    return (uint64_t)0 - (uint64_t)((v | ((uint64_t)0 - v)) >> 63);
+}
+
 /* Sandboxie injects sbiedll.dll into every process it sandboxes -- a walk
  * of PEB->Ldr->InMemoryOrderModuleList (the exact same technique
  * karity_resolve_module already performs for ordinary API resolution) for
  * that one module name is a direct, reliable, Sandboxie-specific signal;
  * not a heuristic like the others in this file. */
-static int karity_asb_check_sandboxie(void)
+static uint64_t karity_asb_check_sandboxie(void)
 {
-    return karity_resolve_module(KARITY_HASH_SBIEDLL_DLL) != 0;
+    return KARITY_ASB_TAINT_SBIE & karity_asb_mask_nz((uint64_t)(uintptr_t)karity_resolve_module(KARITY_HASH_SBIEDLL_DLL));
 }
 
 /* SYSTEM_INFO.dwNumberOfProcessors, x64 offset 0x20 (wProcessorArchitecture
@@ -47,7 +63,7 @@ static int karity_asb_check_sandboxie(void)
  * over a decade; a single-core VM is a common minimal-footprint analysis
  * sandbox configuration (kept small so many instances can run in
  * parallel). */
-static int karity_asb_check_low_cpu_count(void)
+static uint64_t karity_asb_check_low_cpu_count(void)
 {
     void *kernel32 = karity_resolve_module(KARITY_HASH_KERNEL32_DLL);
     karity_pfn_get_system_info get_info;
@@ -60,7 +76,7 @@ static int karity_asb_check_low_cpu_count(void)
 
     get_info(info);
     num_processors = *(uint32_t *)(info + 0x20);
-    return num_processors < 2;
+    return KARITY_ASB_TAINT_LOW_CPU_COUNT & karity_asb_mask_nz((uint64_t)(num_processors < 2));
 }
 
 /* MEMORYSTATUSEX.ullTotalPhys, offset 8 (dwLength(4)+dwMemoryLoad(4) before
@@ -84,7 +100,10 @@ static int karity_asb_check_low_ram(void)
     if (!mem_status(status)) return 0;
 
     total_phys = *(uint64_t *)(status + 8);
-    return total_phys != 0 && total_phys < (1536ULL * 1024 * 1024);
+    /* detected iff RAM reported nonzero (0 = query gave nothing usable) AND
+     * below the 1.5 GiB threshold -- both branchless */
+    return KARITY_ASB_TAINT_LOW_RAM & karity_asb_mask_nz(total_phys) &
+           karity_asb_mask_nz((uint64_t)(total_phys < (1536ULL * 1024 * 1024)));
 }
 
 /* GetTickCount64(): milliseconds since boot, plain return value, no struct.
@@ -103,7 +122,7 @@ static int karity_asb_check_short_uptime(void)
     tick_count_64 = (karity_pfn_get_tick_count_64)karity_resolve_proc(kernel32, KARITY_HASH_GET_TICK_COUNT_64);
     if (!tick_count_64) return 0;
 
-    return tick_count_64() < 180000ULL; /* 3 minutes */
+    return KARITY_ASB_TAINT_SHORT_UPTIME & karity_asb_mask_nz((uint64_t)(tick_count_64() < 180000ULL)); /* 3 min */
 }
 
 /* Sleep-skew: many automated sandboxes hook Sleep/NtDelayExecution to skip
@@ -117,7 +136,7 @@ static int karity_asb_check_short_uptime(void)
  * include/karity/anti_sandbox.h for why that's an acceptable, deliberate
  * one-time cost here rather than something paid on the VM-entry hot
  * path. */
-static int karity_asb_check_sleep_skew(void)
+static uint64_t karity_asb_check_sleep_skew(void)
 {
     void *kernel32 = karity_resolve_module(KARITY_HASH_KERNEL32_DLL);
     karity_pfn_get_tick_count_64 tick_count_64;
@@ -133,18 +152,32 @@ static int karity_asb_check_sleep_skew(void)
     sleep_fn(300);
     t1 = tick_count_64();
 
-    return (t1 - t0) < 150ULL;
+    return KARITY_ASB_TAINT_SLEEP_SKEW & karity_asb_mask_nz((uint64_t)((t1 - t0) < 150ULL));
 }
 
-uint64_t karity_anti_sandbox_scan(void)
+/* Cheap, side-effect-free heuristics -- run unconditionally by the caller
+ * and masked by whether the sandbox category is enabled (runtime/
+ * anti_debug.c). */
+uint64_t karity_anti_sandbox_scan_passive(void)
 {
     uint64_t taint = 0;
-
-    if (karity_asb_check_sandboxie())      taint |= KARITY_ASB_TAINT_SBIE;
-    if (karity_asb_check_low_cpu_count())  taint |= KARITY_ASB_TAINT_LOW_CPU_COUNT;
-    if (karity_asb_check_low_ram())        taint |= KARITY_ASB_TAINT_LOW_RAM;
-    if (karity_asb_check_short_uptime())   taint |= KARITY_ASB_TAINT_SHORT_UPTIME;
-    if (karity_asb_check_sleep_skew())     taint |= KARITY_ASB_TAINT_SLEEP_SKEW;
-
+    taint |= karity_asb_check_sandboxie();
+    taint |= karity_asb_check_low_cpu_count();
+    taint |= karity_asb_check_low_ram();
+    taint |= karity_asb_check_short_uptime();
     return taint;
+}
+
+/* The Sleep-skew probe costs a real ~300ms, so the caller only runs it when
+ * the sandbox category is enabled -- an --anti-sandbox-off binary shouldn't
+ * pay that at startup or on every watchdog tick. */
+uint64_t karity_anti_sandbox_scan_active(void)
+{
+    return karity_asb_check_sleep_skew();
+}
+
+/* Passive | active, for the standalone hosted reporter/tests. */
+uint64_t karity_anti_sandbox_scan(void)
+{
+    return karity_anti_sandbox_scan_passive() | karity_anti_sandbox_scan_active();
 }

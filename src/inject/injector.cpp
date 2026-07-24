@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "karity/bytecode_crypt.h"
+#include "karity/integrity.h"
 #include "karity/isa.h"
 #include "karity/nanomite.h"
 #include "native/interp_codegen.h"
@@ -29,9 +30,10 @@ namespace {
 constexpr size_t kOepJmpSize = 5;      // E9 rel32: all the OEP patch strictly needs
 constexpr size_t kCallQuadsSize = 29;  // E8 rel32 (5) + bytecode delta (8) + exit_target delta (8) + bytecode_key_seed (8)
 constexpr size_t kNanomiteCallQuadsSize = 21; // E8 rel32 (5) + site_table delta (8) + site_count (4) + pad (4)
-constexpr size_t kAntiDebugCallSize = 5; // E8 rel32 only -- karity_anti_debug_install_thunk takes no
-                                          // inline params (see runtime/anti_debug_thunk.S) and returns
-                                          // normally, unlike the nanomite install call right after it
+constexpr size_t kAntiDebugCallSize = 13; // E8 rel32 (5) + enabled_categories (4) + pad (4) -- see
+                                           // runtime/anti_debug_thunk.S's inline params contract
+constexpr size_t kIntegrityCallSize = 21; // E8 rel32 (5) + region delta (8) + region len (8) -- see
+                                           // runtime/integrity_thunk.S's inline params contract
 constexpr uint32_t kSectionAlign = 16;
 
 uint32_t align_up(uint32_t v, uint32_t a) { return (v + a - 1) / a * a; }
@@ -158,7 +160,8 @@ struct Site {
 
 } // namespace
 
-void inject_vm_at_entry(PeImage &img, const std::vector<uint32_t> &extra_entry_rvas, bool skip_oep)
+void inject_vm_at_entry(PeImage &img, const std::vector<uint32_t> &extra_entry_rvas, bool skip_oep,
+                        uint32_t anti_analysis_categories, bool anti_tamper)
 {
     constexpr size_t kMaxProbe = 256;
 
@@ -221,36 +224,57 @@ void inject_vm_at_entry(PeImage &img, const std::vector<uint32_t> &extra_entry_r
     const uint64_t native_call_va = section_va + KARITY_RUNTIME_NATIVE_CALL_OFFSET;
     const uint64_t nanomite_thunk_va = section_va + KARITY_RUNTIME_NANOMITE_THUNK_OFFSET;
     const uint64_t anti_debug_thunk_va = section_va + KARITY_RUNTIME_ANTIDEBUG_THUNK_OFFSET;
+    const uint64_t integrity_thunk_va = section_va + KARITY_RUNTIME_INTEGRITY_THUNK_OFFSET;
     const uint32_t stub_offset = align_up(KARITY_RUNTIME_BLOB_SIZE, kSectionAlign);
 
-    // The anti-debug install call (runtime/anti_debug_thunk.S) sits at the
-    // very first byte of the *first* site's (OEP's) stub -- even before the
-    // nanomite install call right after it -- for the same "no visible setup
-    // moment" reason nanomite's own comment below gives, and because the
-    // background watchdog it spawns (include/karity/anti_debug.h) should be
-    // live as early into the protected program's lifetime as possible.
-    // Unlike the nanomite call, this one takes no inline params and returns
-    // normally (see kAntiDebugCallSize), so it doesn't shift where the
-    // nanomite call's own *contents* start relative to its own return
-    // address -- only where that whole block begins.
+    // Self-integrity ("anti-tamper", include/karity/integrity.h) is opt-in via
+    // --anti-tamper. When on, an install call (runtime/integrity_thunk.S) is
+    // spliced into the OEP stub right after the anti-analysis one, so it takes
+    // up kIntegrityCallSize bytes that everything after it is offset by; when
+    // off, no call is emitted, key quads stay plain, and karity_integrity_taint
+    // stays 0 so vm_thunk.S's XOR is a no-op. kIntegrityCallEff folds that
+    // "present or not" into every offset below.
+    const uint32_t kIntegrityCallEff = anti_tamper ? static_cast<uint32_t>(kIntegrityCallSize) : 0;
+
+    // The anti-analysis install call (runtime/anti_debug_thunk.S) sits at
+    // the very first byte of the *first* site's (OEP's) stub -- even before
+    // the nanomite install call right after it -- for the same "no visible
+    // setup moment" reason nanomite's own comment below gives, and because
+    // the background watchdog it spawns (include/karity/anti_debug.h) should
+    // be live as early into the protected program's lifetime as possible. It
+    // carries 8 bytes of inline params after its call (the enabled-categories
+    // bitmask + pad, see kAntiDebugCallSize and runtime/anti_debug_thunk.S),
+    // so everything after it -- including the nanomite call -- is offset by
+    // the full kAntiDebugCallSize.
     const uint32_t anti_debug_call_offset = stub_offset;
+
+    // The integrity install call (runtime/integrity_thunk.S) sits right after
+    // the anti-analysis one (only when --anti-tamper -- see kIntegrityCallEff),
+    // for the same "as early as possible, no visible setup moment" reasons: its
+    // watchdog should be re-hashing as soon into the program's life as it can,
+    // and every VM entry after this point relies on the checksum it publishes.
+    // Its 16 inline-param bytes (region delta + len) follow its own E8 rel32.
+    const uint32_t integrity_call_offset = stub_offset + static_cast<uint32_t>(kAntiDebugCallSize);
+    const uint32_t integrity_params_offset = integrity_call_offset + 5;
+    const uint64_t integrity_params_va = section_va + integrity_params_offset;
 
     // The nanomite install call (runtime/nanomite_thunk.S) sits right after
     // that, still before any junk -- it runs silently before anything else in
     // the protected program does, so there's no visible "setup" moment for
     // analysis to notice, and by the time any nanomite-protected code is
     // reached the handler is already active. Only OEP is guaranteed to run
-    // exactly once early on, so it's the only site routed through either of
+    // exactly once early on, so it's the only site routed through any of
     // these; extra sites (which may be called many times) jump straight to
     // their own stub_prefix instead.
-    const uint32_t nanomite_params_offset = stub_offset + static_cast<uint32_t>(kAntiDebugCallSize) + 5;
+    const uint32_t nanomite_params_offset =
+        stub_offset + static_cast<uint32_t>(kAntiDebugCallSize) + kIntegrityCallEff + 5;
     const uint64_t nanomite_anchor_va = section_va + nanomite_params_offset;
 
     // --- per-site stub blocks, one after another: [stub_prefix][call thunk
     // + quad][trailing_junk]. This is where each site's own try_lift() runs,
     // since each needs its own anchor (this block's own params_va) before it
     // can produce anchor-relative bytecode.
-    uint32_t offset = stub_offset + static_cast<uint32_t>(kAntiDebugCallSize) +
+    uint32_t offset = stub_offset + static_cast<uint32_t>(kAntiDebugCallSize) + kIntegrityCallEff +
                        static_cast<uint32_t>(kNanomiteCallQuadsSize);
     for (size_t i = 0; i < sites.size(); i++) {
         Site &s = sites[i];
@@ -307,6 +331,22 @@ void inject_vm_at_entry(PeImage &img, const std::vector<uint32_t> &extra_entry_r
     size_t interp_prolog_size = 0;
     const std::vector<uint8_t> interp_code =
         generate_interpreter(native_call_va - interp_va, stub_rng, opcode_map, &interp_prolog_size);
+
+    // Self-integrity checksum (include/karity/integrity.h): hash the finalized
+    // interpreter bytes now, while they're in hand. This is the value the
+    // runtime folds back out of every site's key on each VM entry, so it must
+    // be computed over *exactly* the bytes that end up in the image -- and
+    // nothing patches the interpreter region after this point (the nanomite
+    // params/site-table and SEH splices land elsewhere; karity_interp_rel32
+    // sits in the runtime blob, not here; the interpreter's own native-call
+    // reference is already PIC-baked into interp_code). The one region chosen
+    // is the interpreter itself: the crown jewel an attacker must patch to
+    // defeat the VM, and conveniently self-contained (it holds no key quads, so
+    // there's no circular dependency between the hash and the seeds it keys).
+    // When --anti-tamper is off, integrity_hash stays 0 and every use below is
+    // a no-op. See runtime/integrity.c for the runtime (live-hash) half.
+    const uint64_t integrity_hash =
+        anti_tamper ? karity_integrity_hash(interp_code.data(), interp_code.size()) : 0;
 
     // --- per-site bytecode regions, back-to-back right after the interpreter ---
     uint32_t bytecode_offset = align_up(interp_offset + static_cast<uint32_t>(interp_code.size()), kSectionAlign);
@@ -376,10 +416,30 @@ void inject_vm_at_entry(PeImage &img, const std::vector<uint32_t> &extra_entry_r
 
     section.resize(stub_offset, 0);
 
-    // anti-debug install call: an ordinary call/ret pair (no inline params,
-    // see kAntiDebugCallSize) that falls straight through into the nanomite
-    // install call right after it.
-    emit_call_rel32(section, section_va + anti_debug_call_offset + kAntiDebugCallSize, anti_debug_thunk_va);
+    // anti-analysis install call: the call's return address points at its
+    // own 8-byte inline params (enabled_categories + pad, see runtime/
+    // anti_debug_thunk.S), and the thunk jmp's past them to continue into
+    // the nanomite install call right after. enabled_categories is the
+    // --anti-debug/--anti-vm bitmask; 0 (neither flag) still leaves the
+    // always-on anti-sandbox checks running (see include/karity/anti_debug.h).
+    emit_call_rel32(section, section_va + anti_debug_call_offset + 5, anti_debug_thunk_va);
+    emit_u32le(section, anti_analysis_categories);
+    emit_u32le(section, 0);
+
+    // integrity install call (only with --anti-tamper): the call's return
+    // address points at its own 16-byte inline params (region delta + len, see
+    // runtime/integrity_thunk.S), and the thunk jmp's past them to continue
+    // into the nanomite install call right after. The region is the generated
+    // interpreter [interp_va, interp_va+interp_code.size()); its base is stored
+    // as a delta from these params (base-independent under ASLR, same as every
+    // other cross-.kvm reference here), reconstructed at runtime as params +
+    // delta. When off, no bytes are emitted here and the anti-analysis thunk's
+    // continue point lands directly on the nanomite call (kIntegrityCallEff==0).
+    if (anti_tamper) {
+        emit_call_rel32(section, integrity_params_va, integrity_thunk_va);
+        emit_u64le(section, interp_va - integrity_params_va);
+        emit_u64le(section, static_cast<uint64_t>(interp_code.size()));
+    }
 
     // nanomite install call: falls straight through into site 0's
     // stub_prefix junk below once karity_nanomite_install returns
@@ -404,7 +464,12 @@ void inject_vm_at_entry(PeImage &img, const std::vector<uint32_t> &extra_entry_r
         emit_call_rel32(section, s.params_va, thunk_va);
         emit_u64le(section, s.bytecode_va - s.params_va);
         emit_u64le(section, s.exit_target_va - s.params_va);
-        emit_u64le(section, s.bytecode_key_seed); // raw, not params-relative -- see runtime/vm_thunk.S
+        // Stored key = real_seed ^ integrity_hash. The bytecode itself was
+        // encrypted with real_seed (above); at runtime vm_thunk.S XORs the live
+        // interpreter checksum back in, recovering real_seed iff the
+        // interpreter is pristine (integrity_hash == 0 when --anti-tamper is
+        // off, so this is just real_seed then). See include/karity/integrity.h.
+        emit_u64le(section, s.bytecode_key_seed ^ integrity_hash); // raw, not params-relative -- see runtime/vm_thunk.S
         section.insert(section.end(), s.trailing_junk.begin(), s.trailing_junk.end());
     }
 

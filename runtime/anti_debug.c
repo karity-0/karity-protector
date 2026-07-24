@@ -25,14 +25,23 @@
  * Each check below (and in anti_vm.c/anti_sandbox.c) is independent and
  * self-contained -- deliberately not a table/array of function pointers
  * walked in a loop, which would itself be a single, easy-to-locate site to
- * patch (skip the loop, or zero the table). karity_anti_debug_scan() calls
- * each one directly and ORs a distinct nonzero constant into the
- * accumulator per technique that fires; OR keeps the combination monotonic
- * (any single technique firing is enough to make the whole thing nonzero,
- * so nothing here ever needs a "majority vote" threshold that could itself
- * become a target), while still requiring an attacker to trace and
- * neutralize every contributing check across all three files, not just the
- * first one found.
+ * patch (skip the loop, or zero the table). Each also returns its taint
+ * contribution *directly* -- the taint constant when it fires, 0 when it
+ * doesn't -- computed branchlessly (see karity_ad_mask_nz), rather than a
+ * bool the aggregator branches on. That's the important part: the naive
+ * `if (check()) taint |= CONST;` shape puts a `test/jz ... or imm` per check
+ * right in the open, and each one can be defeated by NOPing a single branch
+ * or OR. Here karity_anti_debug_scan() just ORs the checks' returned values
+ * together with no per-check control flow at all, so there's no such edge to
+ * cut; disabling a check means understanding and killing its arithmetic.
+ * OR-combining keeps the result monotonic (any single technique firing makes
+ * the whole thing nonzero, so nothing here needs a "majority vote" threshold
+ * that could itself become a target), while still requiring an attacker to
+ * trace and neutralize every contributing check across all three files, not
+ * just the first one found. The only genuine branches left are the coarse
+ * per-category execution gates around the few side-effecting/expensive
+ * "active" probes (see karity_anti_debug_scan) -- everything passive is
+ * fully branchless.
  */
 #include "karity/anti_debug.h"
 
@@ -102,6 +111,57 @@ typedef struct {
 uint64_t karity_anti_debug_taint = 0;
 uint32_t karity_anti_debug_enabled_categories = 0;
 
+/* PRNG state for the poison selection below, seeded from RDTSC in
+ * karity_anti_debug_init so it differs every process run. Advanced once per
+ * published-taint update (init + every watchdog tick). */
+static uint64_t g_ad_poison_state;
+
+/* Decoy laundering sinks. An analyst's most direct route to this whole
+ * mechanism is to breakpoint a well-known anti-analysis API
+ * (NtQueryInformationProcess, GetThreadContext, CloseHandle, ...) and
+ * forward-trace its return value -- straight to a mask, then the taint, then
+ * the decryption-key XOR, exposing the entire detect->respond chain. To blunt
+ * that, every API/PEB-derived raw value is *also* smeared into this bank via
+ * meaningless arithmetic (karity_ad_smear, called from each check right where
+ * the raw value is produced), and the live taint is round-tripped through the
+ * bank net-neutrally on every publish (karity_ad_launder_roundtrip). So a
+ * forward trace from any single API fans out into a spray of junk stores
+ * going nowhere, and a backward slice from the published taint physically
+ * runs through memory shared with pure-junk writes -- the real edge is buried
+ * in decoys rather than sitting alone. `volatile` is load-bearing: nothing
+ * ever reads this bank for a real decision, so without it the compiler would
+ * dead-strip every laundering store and fold the net-neutral round-trip back
+ * to the identity, undoing the whole point. This raises the cost of the
+ * "breakpoint the API, follow the value" analysis; it does not make a precise
+ * backward slice from the key XOR outright impossible (the honest remaining
+ * limit -- see look/todo.md). */
+static volatile uint64_t g_ad_decoy[6];
+
+/* A fixed, pre-determined set of nonzero 64-bit "poison" values. When any
+ * analysis check fires, one of these (rotated by a random amount) is folded
+ * into the taint that gets XORed into the bytecode decryption key -- see
+ * karity_ad_poison and the file/anti_debug.h headers. The SET is fixed at
+ * build time ("pre-determined"), but WHICH one, and its rotation, are picked
+ * pseudo-randomly per publish, so the exact corrupted key -- and therefore
+ * where the decrypted bytecode first diverges from a correct decode, and how
+ * it fails (bad opcode, wild jump, wrong memory access, wrong result) --
+ * changes every run and drifts across a run as the watchdog republishes.
+ * Two traces of a detected program can't be diffed to pin down the check:
+ * they diverge in different places each time. Every entry has both its high
+ * and low bit set so no rotation of any of them can be zero (a zero delta
+ * would mean "clean" -- a false negative). */
+#define KARITY_AD_POISON_COUNT 8u
+static const uint64_t karity_ad_poison_table[KARITY_AD_POISON_COUNT] = {
+    0xC952D459E3708D61ULL,
+    0x9CE3ED08EC3C9BE5ULL,
+    0xB1CE297410F5DB4DULL,
+    0xCC66E5588769D801ULL,
+    0x99966EC4A2A39067ULL,
+    0xC6B1231FB19D7C77ULL,
+    0x86B8A2E48B346591ULL,
+    0x971733F41F2C5CFDULL,
+};
+
 static void *karity_ad_peb(void)
 {
     void *peb;
@@ -135,13 +195,109 @@ static uint64_t karity_ad_mix64(uint64_t z)
     return z ^ (z >> 31);
 }
 
+/* Branchless boolean->mask conversion, the core of why the individual checks
+ * below return a taint value directly instead of a bool the caller branches
+ * on. The naive shape -- `if (check()) taint |= CONST;` -- compiles to a
+ * visible `test/jz ... or [taint], imm` sequence per check: a pattern-matcher
+ * (or a human) can locate every one and NOP the branch or the OR, defeating
+ * each check independently with a one-instruction patch. Instead every check
+ * folds its condition into an all-ones-or-zero mask with these (no `cmp`+
+ * conditional-jump pair: `(v | -v) >> 63` is the sign bit of v|-v, which is
+ * set for every v except 0), ANDs the taint constant with it, and the
+ * aggregator just ORs the results with no branch at all -- so there's no
+ * per-check control-flow edge to cut, and disabling one check means
+ * understanding and neutralizing its arithmetic, not flipping one jcc. Same
+ * "affect a value computation, not a branch" principle the whole taint funnel
+ * is built on (see include/karity/anti_debug.h), applied one level down to
+ * the checks' own internal aggregation. */
+static uint64_t karity_ad_mask_nz(uint64_t v)
+{
+    return (uint64_t)0 - (uint64_t)((v | ((uint64_t)0 - v)) >> 63); /* ~0 if v!=0, else 0 */
+}
+
+static uint64_t karity_ad_mask_z(uint64_t v)
+{
+    return ~karity_ad_mask_nz(v); /* ~0 if v==0, else 0 */
+}
+
+/* All-ones if the given anti-analysis category is enabled this run, else 0
+ * (see karity_anti_debug_enabled_categories). Also branchless, so the
+ * category gate on the *value* (as opposed to the coarse execution gates
+ * around the few side-effecting probes -- see karity_anti_debug_scan) is
+ * likewise not a single jump that switches a whole category off. */
+static uint64_t karity_ad_category_mask(uint32_t bit)
+{
+    return karity_ad_mask_nz((uint64_t)(karity_anti_debug_enabled_categories & bit));
+}
+
+/* Folds `v` (a raw API/PEB result, or the taint) into the decoy bank with
+ * junk arithmetic -- rotations, an odd multiply, cross-slot XOR/mix -- so the
+ * value visibly propagates into several unrelated-looking locations. Never
+ * affects any real decision (nothing reads g_ad_decoy for one); its whole
+ * purpose is to be a fan-out sink for data-flow tracing. See g_ad_decoy. */
+static void karity_ad_smear(uint64_t v)
+{
+    uint64_t s0 = g_ad_decoy[0], s1 = g_ad_decoy[1], s2 = g_ad_decoy[2], s3 = g_ad_decoy[3];
+    g_ad_decoy[0] = (s0 + v) * 0x9E3779B97F4A7C15ULL;
+    g_ad_decoy[1] = s1 ^ ((v << 17) | (v >> 47));
+    g_ad_decoy[2] = (s2 ^ v) + (s0 & v);
+    g_ad_decoy[3] = s3 * 5u + (v ^ s1);
+    g_ad_decoy[4] = karity_ad_mix64(g_ad_decoy[4] ^ v);
+}
+
+/* Physically routes the real taint `t` through the decoy bank and returns it
+ * *exactly* unchanged (net-neutral), so a backward slice from the published
+ * value runs through g_ad_decoy -- memory that karity_ad_smear also fills
+ * with pure junk -- instead of a clean edge back to the checks. slot 5 holds
+ * `t ^ old_junk` across the smears (which only touch slots 0-4), and the
+ * final reload recovers t; `volatile` forces the store and reload to be real
+ * memory traffic the compiler can't fold away. */
+static uint64_t karity_ad_launder_roundtrip(uint64_t t)
+{
+    uint64_t pad = g_ad_decoy[5];
+    g_ad_decoy[5] = t ^ pad;
+    karity_ad_smear(t);
+    karity_ad_smear(~t + 0x51ULL);
+    return g_ad_decoy[5] ^ pad; /* == t, but forced through volatile memory */
+}
+
+/* Turns a raw scan result into the value actually published to
+ * karity_anti_debug_taint. Clean (raw == 0) stays *exactly* 0 -- bit for bit,
+ * so the XOR into the bytecode key in runtime/vm_thunk.S remains a true
+ * no-op and a legitimate run is never affected (branchless: everything below
+ * is ANDed with `detected`). When any check fired (raw != 0), it mixes in a
+ * pseudo-randomly chosen, pseudo-randomly rotated entry from the fixed
+ * karity_ad_poison_table so the published value -- and hence the corrupted
+ * decryption key -- differs every run and drifts every watchdog tick. The
+ * point is variety of *failure*: the same detected binary decodes a
+ * different wrong instruction stream each time, so it crashes/loops/misbe-
+ * haves in a different place on every run and two traces can't be diffed to
+ * locate the check. Guaranteed nonzero when detected (the table entries all
+ * have bit 63 set, rotation preserves nonzero-ness, and the final `| 1`
+ * pins it regardless) so a detected run can never accidentally publish a
+ * clean 0. */
+static uint64_t karity_ad_poison(uint64_t raw)
+{
+    uint64_t detected = karity_ad_mask_nz(raw);
+    uint64_t pick, rot, val;
+
+    g_ad_poison_state = karity_ad_mix64(g_ad_poison_state + 0x9E3779B97F4A7C15ULL);
+    pick = karity_ad_poison_table[g_ad_poison_state & (KARITY_AD_POISON_COUNT - 1u)];
+    rot = (g_ad_poison_state >> 8) & 63u;
+    val = (pick << rot) | (pick >> ((64u - rot) & 63u)); /* rotate-left, rot==0 safe */
+
+    return ((raw ^ val) & detected) | (detected & 1ULL);
+}
+
 /* PEB->BeingDebugged (offset 0x02, BYTE). The oldest and most commonly
  * patched-around check in existence -- included anyway because it's still
  * one contribution among many, not the whole defense. */
-static int karity_ad_check_being_debugged(void)
+static uint64_t karity_ad_check_being_debugged(void)
 {
     uint8_t *peb = (uint8_t *)karity_ad_peb();
-    return peb[0x02] != 0;
+    uint8_t bd = peb[0x02];
+    karity_ad_smear(bd); /* fan the raw PEB byte out into decoys (see g_ad_decoy) */
+    return KARITY_AD_TAINT_BEING_DEBUGGED & karity_ad_mask_nz(bd);
 }
 
 /* PEB->NtGlobalFlag (offset 0xBC, DWORD, x64). The loader sets
@@ -149,11 +305,12 @@ static int karity_ad_check_being_debugged(void)
  * FLG_HEAP_VALIDATE_PARAMETERS (0x70) here when the process was created
  * under a debugger -- independent of BeingDebugged, and less commonly
  * patched since fewer public snippets check it. */
-static int karity_ad_check_nt_global_flag(void)
+static uint64_t karity_ad_check_nt_global_flag(void)
 {
     uint8_t *peb = (uint8_t *)karity_ad_peb();
     uint32_t flags = *(uint32_t *)(peb + 0xBC);
-    return (flags & 0x70u) != 0;
+    karity_ad_smear(flags);
+    return KARITY_AD_TAINT_NT_GLOBAL_FLAG & karity_ad_mask_nz(flags & 0x70u);
 }
 
 /* PEB->ProcessHeap(+0x30)->ForceFlags(+0x74, DWORD, x64 classic NT heap
@@ -167,12 +324,16 @@ static int karity_ad_check_nt_global_flag(void)
  * releases and isn't worth the false-positive risk -- same "define what's
  * safe to define, leave the rest alone" stance as isa.h's OF-for-count>1
  * notes. */
-static int karity_ad_check_heap_force_flags(void)
+static uint64_t karity_ad_check_heap_force_flags(void)
 {
     uint8_t *peb = (uint8_t *)karity_ad_peb();
     uint8_t *heap = *(uint8_t **)(peb + 0x30);
-    if (!heap) return 0;
-    return *(uint32_t *)(heap + 0x74) != 0;
+    uint32_t force_flags;
+    if (!heap) return 0; /* safety guard (can't deref null), not the detection decision -- the
+                            "is it forced?" verdict below is what's kept branchless */
+    force_flags = *(uint32_t *)(heap + 0x74);
+    karity_ad_smear(force_flags);
+    return KARITY_AD_TAINT_HEAP_FORCE_FLAGS & karity_ad_mask_nz(force_flags);
 }
 
 static void *karity_ad_resolve_ntdll(void)
@@ -185,7 +346,7 @@ static void *karity_ad_resolve_ntdll(void)
  * (returns "clean") if ntdll or the export can't be resolved -- same "wrong
  * is worse than nothing" stance as every other best-effort check in this
  * runtime. */
-static int karity_ad_check_debug_port(void)
+static uint64_t karity_ad_check_debug_port(void)
 {
     void *ntdll = karity_ad_resolve_ntdll();
     karity_pfn_nt_query_information_process query;
@@ -198,7 +359,9 @@ static int karity_ad_check_debug_port(void)
 
     status = query((void *)(intptr_t)-1 /* GetCurrentProcess() pseudo handle */, 7 /* ProcessDebugPort */,
                     &debug_port, 8, 0);
-    return status == 0 && debug_port != 0;
+    karity_ad_smear(debug_port ^ (uint64_t)(uint32_t)status);
+    /* detected iff the call succeeded (status==0) AND the port is nonzero */
+    return KARITY_AD_TAINT_DEBUG_PORT & karity_ad_mask_z((uint64_t)(uint32_t)status) & karity_ad_mask_nz(debug_port);
 }
 
 /* NtQueryInformationProcess(ProcessDebugFlags=0x1F): a ULONG that's really
@@ -206,7 +369,7 @@ static int karity_ad_check_debug_port(void)
  * the process *is* being debugged, nonzero means it isn't. Independent
  * information source from ProcessDebugPort (different EPROCESS field
  * entirely), so a patch that only fakes the port doesn't fake this too. */
-static int karity_ad_check_debug_flags(void)
+static uint64_t karity_ad_check_debug_flags(void)
 {
     void *ntdll = karity_ad_resolve_ntdll();
     karity_pfn_nt_query_information_process query;
@@ -218,7 +381,9 @@ static int karity_ad_check_debug_flags(void)
     if (!query) return 0;
 
     status = query((void *)(intptr_t)-1, 0x1F /* ProcessDebugFlags */, &no_debug_inherit, 4, 0);
-    return status == 0 && no_debug_inherit == 0;
+    karity_ad_smear(((uint64_t)no_debug_inherit << 32) ^ (uint64_t)(uint32_t)status);
+    /* detected iff the call succeeded (status==0) AND NoDebugInherit is 0 */
+    return KARITY_AD_TAINT_DEBUG_FLAGS & karity_ad_mask_z((uint64_t)(uint32_t)status) & karity_ad_mask_z(no_debug_inherit);
 }
 
 /* NtQueryInformationProcess(ProcessDebugObjectHandle=0x1E): succeeds with a
@@ -226,7 +391,7 @@ static int karity_ad_check_debug_flags(void)
  * debugger) exists for this process; fails with STATUS_PORT_NOT_SET
  * otherwise. Lesser-known than the port/flags queries above -- most public
  * anti-debug snippets stop at ProcessDebugPort. */
-static int karity_ad_check_debug_object_handle(void)
+static uint64_t karity_ad_check_debug_object_handle(void)
 {
     void *ntdll = karity_ad_resolve_ntdll();
     karity_pfn_nt_query_information_process query;
@@ -238,7 +403,9 @@ static int karity_ad_check_debug_object_handle(void)
     if (!query) return 0;
 
     status = query((void *)(intptr_t)-1, 0x1E /* ProcessDebugObjectHandle */, &handle, 8, 0);
-    return status == 0 && handle != 0;
+    karity_ad_smear(handle ^ (uint64_t)(uint32_t)status);
+    /* detected iff the call succeeded (status==0) AND a nonzero handle came back */
+    return KARITY_AD_TAINT_DEBUG_OBJECT & karity_ad_mask_z((uint64_t)(uint32_t)status) & karity_ad_mask_nz(handle);
 }
 
 /* GetThreadContext(current thread, CONTEXT_DEBUG_REGISTERS) -> Dr0..Dr3
@@ -256,7 +423,7 @@ static int karity_ad_check_debug_object_handle(void)
  * buffer (documented CONTEXT requirement); sized generously past the real
  * x64 CONTEXT (1232 bytes) since this file has no <windows.h> to take
  * sizeof(CONTEXT) from. */
-static int karity_ad_check_hardware_breakpoints(void)
+static uint64_t karity_ad_check_hardware_breakpoints(void)
 {
     void *kernel32 = karity_resolve_module(KARITY_HASH_KERNEL32_DLL);
     karity_pfn_get_thread_context get_ctx;
@@ -276,7 +443,9 @@ static int karity_ad_check_hardware_breakpoints(void)
     dr1 = *(uint64_t *)(ctx_buf + 0x50);
     dr2 = *(uint64_t *)(ctx_buf + 0x58);
     dr3 = *(uint64_t *)(ctx_buf + 0x60);
-    return (dr0 | dr1 | dr2 | dr3) != 0;
+    karity_ad_smear(dr0 ^ dr1);
+    karity_ad_smear(dr2 ^ dr3);
+    return KARITY_AD_TAINT_HW_BREAKPOINT & karity_ad_mask_nz(dr0 | dr1 | dr2 | dr3);
 }
 
 static volatile int g_ad_closehandle_trapped;
@@ -303,7 +472,7 @@ static int32_t karity_ad_closehandle_veh(karity_ad_exception_pointers *ep)
  * temporary VEH around one call" shape (rather than a bare CloseHandle +
  * an obvious __except) makes it much less recognizable at a glance than
  * how it's usually written. */
-static int karity_ad_check_closehandle_trap(void)
+static uint64_t karity_ad_check_closehandle_trap(void)
 {
     void *kernel32 = karity_resolve_module(KARITY_HASH_KERNEL32_DLL);
     karity_pfn_add_veh add_veh;
@@ -326,7 +495,8 @@ static int karity_ad_check_closehandle_trap(void)
     trapped = g_ad_closehandle_trapped;
 
     remove_veh(veh);
-    return trapped;
+    karity_ad_smear((uint64_t)(uint32_t)trapped * 0x100000001ULL);
+    return KARITY_AD_TAINT_CLOSEHANDLE_TRAP & karity_ad_mask_nz((uint64_t)(uint32_t)trapped);
 }
 
 static volatile int g_ad_int3_reached;
@@ -360,15 +530,14 @@ static int32_t karity_ad_int3_veh(karity_ad_exception_pointers *ep)
  * exception dispatch's cost, typically thousands to low hundred-thousands
  * of cycles even on a loaded system) is deliberately loose to avoid
  * flagging scheduler jitter or a slow VM as a debugger. */
-static int karity_ad_check_hidden_int3(uint64_t *out_timing_taint)
+static uint64_t karity_ad_check_hidden_int3(void)
 {
     void *kernel32 = karity_resolve_module(KARITY_HASH_KERNEL32_DLL);
     karity_pfn_add_veh add_veh;
     karity_pfn_remove_veh remove_veh;
     void *veh;
-    uint64_t t0, t1;
+    uint64_t t0, t1, elapsed, taint;
 
-    *out_timing_taint = 0;
     if (!kernel32) return 0;
     add_veh = (karity_pfn_add_veh)karity_resolve_proc(kernel32, KARITY_HASH_ADD_VECTORED_EXCEPTION_HANDLER);
     remove_veh = (karity_pfn_remove_veh)karity_resolve_proc(kernel32, KARITY_HASH_REMOVE_VECTORED_EXCEPTION_HANDLER);
@@ -384,42 +553,80 @@ static int karity_ad_check_hidden_int3(uint64_t *out_timing_taint)
 
     remove_veh(veh);
 
-    if (t1 - t0 > 50000000ULL) *out_timing_taint = KARITY_AD_TAINT_INT3_TIMING;
-    return !g_ad_int3_reached;
+    /* Two independent signals, both branchless: "our handler never ran"
+     * (g_ad_int3_reached still 0) and "the round trip took absurdly long".
+     * `elapsed > threshold` is a setcc, not a jump; mask_nz turns it into
+     * the timing taint constant. mask_z(reached) contributes the primary
+     * taint when the handler was skipped entirely. */
+    elapsed = t1 - t0;
+    karity_ad_smear(elapsed ^ ((uint64_t)(uint32_t)g_ad_int3_reached << 40));
+    taint = KARITY_AD_TAINT_HIDDEN_INT3 & karity_ad_mask_z((uint64_t)(uint32_t)g_ad_int3_reached);
+    taint |= KARITY_AD_TAINT_INT3_TIMING & karity_ad_mask_nz((uint64_t)(elapsed > 50000000ULL));
+    return taint;
 }
 
-/* Runs every *enabled* debug-detection technique above once, ORs each
- * one's contribution into a single accumulator (see the file header for
- * why OR, and why this isn't a table-driven loop), then does the same for
- * every hypervisor-detection technique (runtime/anti_vm.c) if that
- * category is enabled too -- one combined result, one funnel. Anti-sandbox
- * (runtime/anti_sandbox.c) always runs, unconditionally: see
- * include/karity/anti_debug.h's file header for why its false-positive
- * profile doesn't need the same opt-in gate debug/VM detection do. */
+/* Combines every enabled detection technique into one taint value. Two
+ * classes of check, treated differently:
+ *
+ *  - PASSIVE checks (all the debug queries above except the two exception
+ *    probes, plus anti_vm's CPUID checks and anti_sandbox's PEB/quota
+ *    checks) are side-effect-free and cheap, so they run *unconditionally*
+ *    and their contribution is masked by a branchless per-category mask.
+ *    There is deliberately no `if (enabled & CAT)` around them: a category
+ *    being off is expressed purely as an AND with a zero mask, so no single
+ *    control-flow edge switches a whole category's detection off (nor does
+ *    any single per-check branch -- see karity_ad_mask_nz's comment). When a
+ *    category is off, its checks still run but contribute 0; when on, the
+ *    mask is all-ones and they contribute normally. Passive debug checks
+ *    running under a debugger with --anti-debug *off* is harmless: they read
+ *    PEB fields, raise nothing, and their result is masked away.
+ *
+ *  - ACTIVE probes (the CloseHandle and int3 debug probes; anti_vm's VMware
+ *    backdoor; anti_sandbox's Sleep-skew) each either raise a first-chance
+ *    exception (debugger-observable) or cost real wall-clock time, so unlike
+ *    the passive checks they must NOT run when their category is off -- a
+ *    program built without --anti-debug must stay completely transparent to
+ *    a debugger, and one without --anti-sandbox must not eat 300ms at
+ *    startup. These few get a genuine execution gate. That gate switches
+ *    only these side-effecting probes, not a whole category's detection
+ *    (the passive checks for the same category are already covering it
+ *    branchlessly), so it's not the single "disable everything" edge the
+ *    per-check branches used to be. Contributions are still mask-ANDed for
+ *    defense in depth. */
 uint64_t karity_anti_debug_scan(void)
 {
     uint64_t taint = 0;
+    uint64_t debug_mask = karity_ad_category_mask(KARITY_ANTI_ANALYSIS_DEBUG);
+    uint64_t vm_mask = karity_ad_category_mask(KARITY_ANTI_ANALYSIS_VM);
+    uint64_t sandbox_mask = karity_ad_category_mask(KARITY_ANTI_ANALYSIS_SANDBOX);
+    uint64_t passive = 0;
 
+    /* passive debug checks -- run always, contribute only through debug_mask */
+    passive |= karity_ad_check_being_debugged();
+    passive |= karity_ad_check_nt_global_flag();
+    passive |= karity_ad_check_heap_force_flags();
+    passive |= karity_ad_check_debug_port();
+    passive |= karity_ad_check_debug_flags();
+    passive |= karity_ad_check_debug_object_handle();
+    passive |= karity_ad_check_hardware_breakpoints();
+    taint |= passive & debug_mask;
+
+    /* passive VM / sandbox checks -- likewise unconditional, masked by category */
+    taint |= karity_anti_vm_scan_passive() & vm_mask;
+    taint |= karity_anti_sandbox_scan_passive() & sandbox_mask;
+
+    /* active, side-effecting probes -- genuinely gated on their category (see
+     * the function comment), then still mask-ANDed */
     if (karity_anti_debug_enabled_categories & KARITY_ANTI_ANALYSIS_DEBUG) {
-        uint64_t int3_timing_taint = 0;
-
-        if (karity_ad_check_being_debugged())        taint |= KARITY_AD_TAINT_BEING_DEBUGGED;
-        if (karity_ad_check_nt_global_flag())         taint |= KARITY_AD_TAINT_NT_GLOBAL_FLAG;
-        if (karity_ad_check_heap_force_flags())       taint |= KARITY_AD_TAINT_HEAP_FORCE_FLAGS;
-        if (karity_ad_check_debug_port())             taint |= KARITY_AD_TAINT_DEBUG_PORT;
-        if (karity_ad_check_debug_flags())            taint |= KARITY_AD_TAINT_DEBUG_FLAGS;
-        if (karity_ad_check_debug_object_handle())    taint |= KARITY_AD_TAINT_DEBUG_OBJECT;
-        if (karity_ad_check_hardware_breakpoints())   taint |= KARITY_AD_TAINT_HW_BREAKPOINT;
-        if (karity_ad_check_closehandle_trap())       taint |= KARITY_AD_TAINT_CLOSEHANDLE_TRAP;
-        if (karity_ad_check_hidden_int3(&int3_timing_taint)) taint |= KARITY_AD_TAINT_HIDDEN_INT3;
-        taint |= int3_timing_taint;
+        uint64_t probes = karity_ad_check_closehandle_trap() | karity_ad_check_hidden_int3();
+        taint |= probes & debug_mask;
     }
-
     if (karity_anti_debug_enabled_categories & KARITY_ANTI_ANALYSIS_VM) {
-        taint |= karity_anti_vm_scan();
+        taint |= karity_anti_vm_scan_active() & vm_mask;
     }
-
-    taint |= karity_anti_sandbox_scan();
+    if (karity_anti_debug_enabled_categories & KARITY_ANTI_ANALYSIS_SANDBOX) {
+        taint |= karity_anti_sandbox_scan_active() & sandbox_mask;
+    }
 
     return taint;
 }
@@ -448,18 +655,32 @@ static uint32_t karity_ad_watchdog_proc(void *param)
         sleep_fn(200u + (uint32_t)(jitter_state % 300u)); /* 200-500ms, jittered so the interval
                                                                itself isn't a fixed, greppable
                                                                constant in a timeline trace */
-        karity_anti_debug_taint = karity_anti_debug_scan();
+        /* Republish through karity_ad_poison: a *clean* scan stays exactly 0
+         * (no-op key XOR), a *detected* one gets a freshly randomized poison
+         * each tick -- so the corrupted-key value, and thus where/how a
+         * detected program misbehaves, drifts over the process's lifetime as
+         * well as differing run-to-run. The scan result is first round-tripped
+         * through the decoy bank (net-neutral) so the value's data flow is
+         * entangled with junk -- see g_ad_decoy. */
+        karity_anti_debug_taint =
+            karity_ad_poison(karity_ad_launder_roundtrip(karity_anti_debug_scan()));
     }
 }
 
-int karity_anti_debug_init(void)
+int karity_anti_debug_init(uint32_t enabled_categories)
 {
     void *kernel32;
     karity_pfn_create_thread create_thread;
     karity_pfn_close_handle close_handle;
     void *thread;
 
-    karity_anti_debug_taint = karity_anti_debug_scan();
+    karity_anti_debug_enabled_categories = enabled_categories;
+    /* Seed the poison PRNG from the cycle counter so the first (and every)
+     * published poison differs per process run -- the whole point is that a
+     * detected binary's failure isn't reproducible across runs. */
+    g_ad_poison_state = karity_ad_rdtsc();
+    karity_anti_debug_taint =
+        karity_ad_poison(karity_ad_launder_roundtrip(karity_anti_debug_scan()));
 
     kernel32 = karity_resolve_module(KARITY_HASH_KERNEL32_DLL);
     if (!kernel32) return 1;

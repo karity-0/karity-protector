@@ -32,14 +32,43 @@ static void *read_peb(void)
     return peb;
 }
 
+/* Every category is opt-in (see include/karity/anti_debug.h) -- every test
+ * here that pokes a *debugger* signal first enables the debug category,
+ * exactly as src/inject/injector.cpp does at protect time via --anti-debug,
+ * so karity_anti_debug_scan() actually contributes those checks. Without it
+ * the scan masks them away entirely (the whole point of the gate), which is
+ * itself worth one assertion -- see test_debug_category_gate below. The
+ * tests deliberately enable ONLY the debug category, never sandbox: that
+ * keeps sandbox's ~300ms Sleep-skew probe from running and keeps VM
+ * detection masked off (this machine may itself be a VM -- see
+ * tests/test_anti_vm.c). */
+
 /* Not itself running under a debugger is the whole premise of ctest running
  * unattended in CI -- if this genuinely fails, either a real debugger is
  * attached to the test process (expected to fail, not a bug) or one of the
- * checks has a false-positive bug worth investigating. */
+ * debug checks has a false-positive bug worth investigating. */
 static void test_scan_is_clean_by_default(void)
 {
-    uint64_t taint = karity_anti_debug_scan();
+    uint64_t taint;
+    karity_anti_debug_enabled_categories = KARITY_ANTI_ANALYSIS_DEBUG;
+    taint = karity_anti_debug_scan();
     CHECK(taint == 0, "karity_anti_debug_scan() is 0 when not actually being debugged");
+}
+
+/* With no category enabled, poking a debugger signal must NOT move the scan
+ * -- proves the branchless per-category mask actually zeroes a disabled
+ * category's contribution (enabled=0 => every mask is 0 => scan is 0
+ * regardless of environment, even on a VM). */
+static void test_debug_category_gate(void)
+{
+    uint8_t *peb = (uint8_t *)read_peb();
+    uint8_t original = peb[0x02];
+
+    karity_anti_debug_enabled_categories = 0; /* no category enabled */
+    peb[0x02] = 1;
+    CHECK(karity_anti_debug_scan() == 0,
+          "with no category enabled, PEB->BeingDebugged does NOT move the scan");
+    peb[0x02] = original;
 }
 
 static void test_being_debugged_bit(void)
@@ -47,6 +76,7 @@ static void test_being_debugged_bit(void)
     uint8_t *peb = (uint8_t *)read_peb();
     uint8_t original = peb[0x02];
 
+    karity_anti_debug_enabled_categories = KARITY_ANTI_ANALYSIS_DEBUG;
     peb[0x02] = 1;
     CHECK(karity_anti_debug_scan() != 0, "flipping PEB->BeingDebugged makes the scan nonzero");
 
@@ -60,6 +90,7 @@ static void test_nt_global_flag_bits(void)
     uint32_t *flags = (uint32_t *)(peb + 0xBC);
     uint32_t original = *flags;
 
+    karity_anti_debug_enabled_categories = KARITY_ANTI_ANALYSIS_DEBUG;
     *flags = original | 0x70u; /* FLG_HEAP_ENABLE_TAIL_CHECK|FREE_CHECK|VALIDATE_PARAMETERS */
     CHECK(karity_anti_debug_scan() != 0, "setting PEB->NtGlobalFlag's debug bits makes the scan nonzero");
 
@@ -79,6 +110,7 @@ static void test_nt_global_flag_bits(void)
 int main(void)
 {
     test_scan_is_clean_by_default();
+    test_debug_category_gate();
     test_being_debugged_bit();
     test_nt_global_flag_bits();
 

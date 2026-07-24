@@ -35,6 +35,20 @@
  * site to patch: an attacker has to find and neutralize *every*
  * contributing technique's effect on the taint value, not one branch.
  *
+ * The value published on detection is not fixed. A clean scan publishes
+ * exactly 0 (the XOR stays a true no-op -- legitimate runs are never
+ * touched), but a scan that fired mixes in a pseudo-randomly chosen,
+ * pseudo-randomly rotated entry from a fixed, pre-determined poison table
+ * (see runtime/anti_debug.c's karity_ad_poison), reseeded from the cycle
+ * counter each process run and re-rolled on every watchdog tick. So a
+ * detected binary decrypts a *different* wrong instruction stream every run
+ * -- and even drifts within a single run -- crashing, looping, or producing
+ * a wrong result in a different place each time. Two traces of a detected
+ * program therefore diverge from a correct trace at different points, so an
+ * analyst can't diff them against each other to pin down which check fired
+ * or where the tamper response lives; the failure is deliberately a moving
+ * target rather than one reproducible fault.
+ *
  * This is a mitigation, not a proof -- same stance as opcode randomization
  * and rolling decryption before it (see their own "남은 한계" writeups in
  * look/todo.md). A sufficiently patient attacker with a kernel debugger or
@@ -45,22 +59,25 @@
  * multi-technique, watchdog-refreshed value computation before touching
  * anything else."
  *
- * anti-debug and anti-VM are opt-in (see KARITY_ANTI_ANALYSIS_DEBUG/_VM and
- * karity_anti_debug_init below), anti-sandbox is not. This split exists
- * because their false-positive profiles are genuinely different, not out of
- * caution for its own sake: a real end user is essentially never "being
- * debugged", but a substantial and entirely legitimate fraction of real
- * deployments run *inside a VM* on purpose (cloud desktops, corporate VDI,
- * Parallels/VMware Fusion, Windows Sandbox, CI) -- unconditionally corrupting
- * decryption for all of them the moment the hypervisor bit is set would
- * break the protected program for users who did nothing wrong. This was
- * empirically confirmed, not just theorized: this project's own build/test
- * machine turned out to itself be running under a hypervisor the first time
- * anti-VM detection was tried here (see look/todo.md). anti-sandbox's
- * heuristics (Sandboxie's injected DLL, unusually low CPU/RAM, a suspiciously
- * fresh boot, a hooked/skipped Sleep) don't have that same broad legitimate-
- * use collision, so they stay unconditional like anti-debug's checks
- * originally shipped.
+ * All three categories are opt-in (see KARITY_ANTI_ANALYSIS_* and
+ * karity_anti_debug_init below) -- none run unless the corresponding
+ * --anti-debug/--anti-vm/--anti-sandbox flag was passed at protect time.
+ * The categories still differ sharply in *how safe they are to enable*, and
+ * that difference is real, not cosmetic: a genuine end user is essentially
+ * never "being debugged", but a substantial and entirely legitimate fraction
+ * of real deployments run *inside a VM* on purpose (cloud desktops, corporate
+ * VDI, Parallels/VMware Fusion, Windows Sandbox, CI) -- so --anti-vm in
+ * particular will corrupt decryption for users who did nothing wrong, and
+ * must be a deliberate choice. This was empirically confirmed, not just
+ * theorized: this project's own build/test machine turned out to itself be
+ * running under a hypervisor the first time anti-VM detection was tried here
+ * (see look/todo.md). anti-sandbox's heuristics (Sandboxie's injected DLL,
+ * unusually low CPU/RAM, a suspiciously fresh boot, a hooked/skipped Sleep)
+ * carry less legitimate-use collision than anti-vm but more than anti-debug,
+ * and its Sleep-skew probe costs a real ~300ms -- so it too is opt-in rather
+ * than forced on. (An earlier revision left anti-sandbox unconditional;
+ * making it a flag like the other two keeps the model uniform and gives the
+ * operator one switch per category.)
  */
 #ifndef KARITY_ANTI_DEBUG_H
 #define KARITY_ANTI_DEBUG_H
@@ -71,25 +88,27 @@
 extern "C" {
 #endif
 
-/* Bits for karity_anti_debug_init's enabled_categories parameter --
- * anti-sandbox has no bit here because it's never gated (see the file
- * header). Shared between src/inject/injector.cpp (which builds this from
- * --anti-debug/--anti-vm CLI flags at protect time) and
+/* Bits for karity_anti_debug_init's enabled_categories parameter, one per
+ * category. Shared between src/inject/injector.cpp (which builds this from
+ * the --anti-debug/--anti-vm/--anti-sandbox CLI flags at protect time) and
  * runtime/anti_debug_thunk.S's call-site params (see that file), so the
  * choice made at protect time reaches the running program without needing
  * to recompile the freestanding runtime blob per protect run. */
-#define KARITY_ANTI_ANALYSIS_DEBUG 0x1u
-#define KARITY_ANTI_ANALYSIS_VM    0x2u
+#define KARITY_ANTI_ANALYSIS_DEBUG   0x1u
+#define KARITY_ANTI_ANALYSIS_VM      0x2u
+#define KARITY_ANTI_ANALYSIS_SANDBOX 0x4u
 
-/* Which categories karity_anti_debug_scan() actually runs -- set once by
- * karity_anti_debug_init below (from its enabled_categories parameter) and
- * consulted by every scan after that, including the watchdog's periodic
- * ones. Exposed directly (rather than only through the init parameter) so
- * tests/test_anti_debug.c can flip categories on/off without spawning a
- * real watchdog thread just to do it -- same "poke the real state
- * directly" testing style already used there for PEB fields. Starts at 0
- * (BSS): a build that never calls karity_anti_debug_init (most hosted
- * tests) runs no debug/VM checks and only the always-on sandbox ones. */
+/* Which categories karity_anti_debug_scan() actually contributes -- set once
+ * by karity_anti_debug_init below (from its enabled_categories parameter)
+ * and consulted by every scan after that, including the watchdog's periodic
+ * ones. The passive checks read it as a branchless per-category AND mask
+ * (see runtime/anti_debug.c); the few side-effecting active probes read it
+ * as a real execution gate. Exposed directly (rather than only through the
+ * init parameter) so tests/test_anti_debug.c can flip categories on/off
+ * without spawning a real watchdog thread just to do it -- same "poke the
+ * real state directly" testing style already used there for PEB fields.
+ * Starts at 0 (BSS): a build that never calls karity_anti_debug_init (most
+ * hosted tests) contributes nothing from any category. */
 extern uint32_t karity_anti_debug_enabled_categories;
 
 /* Runs every *enabled* detection technique once, synchronously, and

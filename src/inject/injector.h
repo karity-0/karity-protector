@@ -59,6 +59,23 @@ namespace karity {
 // call into a virtualized site was never affected either way -- there's no
 // nesting, since it doesn't go through karity_vm_native_call's stack swap
 // at all.
-void inject_vm_at_entry(PeImage &img, const std::vector<uint32_t> &extra_entry_rvas = {}, bool skip_oep = false);
+// `anti_analysis_categories` is a KARITY_ANTI_ANALYSIS_* bitmask (see
+// include/karity/anti_debug.h) chosen from the --anti-debug/--anti-vm/
+// --anti-sandbox CLI flags: it's baked into the OEP stub's anti-analysis
+// install call so the running program only runs the detection categories the
+// user opted into. 0 (no flags) leaves all anti-analysis detection off --
+// see that header for the per-category false-positive reasoning.
+//
+// `anti_tamper` (--anti-tamper) turns on self-integrity checking: the
+// generated interpreter is hashed at protect time and that checksum is folded
+// into every site's bytecode decryption key, so any post-protection patch to
+// the interpreter corrupts decryption instead of tripping a defeatable branch
+// (see include/karity/integrity.h). It adds an integrity install call to the
+// OEP stub and stores each key quad as (real_seed ^ H_expected). Off by
+// default; unlike the anti-analysis categories it has no legitimate-use false
+// positives (the image's own bytes are identical for every user), so it's a
+// safe switch to leave on.
+void inject_vm_at_entry(PeImage &img, const std::vector<uint32_t> &extra_entry_rvas = {}, bool skip_oep = false,
+                        uint32_t anti_analysis_categories = 0, bool anti_tamper = false);
 
 } // namespace karity
