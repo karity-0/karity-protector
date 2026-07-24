@@ -100,6 +100,7 @@ typedef struct {
 } karity_ad_exception_pointers;
 
 uint64_t karity_anti_debug_taint = 0;
+uint32_t karity_anti_debug_enabled_categories = 0;
 
 static void *karity_ad_peb(void)
 {
@@ -387,28 +388,37 @@ static int karity_ad_check_hidden_int3(uint64_t *out_timing_taint)
     return !g_ad_int3_reached;
 }
 
-/* Runs every debug-detection technique above once, ORs each one's
- * contribution into a single accumulator (see the file header for why OR,
- * and why this isn't a table-driven loop), then does the same for every
- * hypervisor-detection technique (runtime/anti_vm.c) and sandbox heuristic
- * (runtime/anti_sandbox.c) -- one combined result, one funnel. */
+/* Runs every *enabled* debug-detection technique above once, ORs each
+ * one's contribution into a single accumulator (see the file header for
+ * why OR, and why this isn't a table-driven loop), then does the same for
+ * every hypervisor-detection technique (runtime/anti_vm.c) if that
+ * category is enabled too -- one combined result, one funnel. Anti-sandbox
+ * (runtime/anti_sandbox.c) always runs, unconditionally: see
+ * include/karity/anti_debug.h's file header for why its false-positive
+ * profile doesn't need the same opt-in gate debug/VM detection do. */
 uint64_t karity_anti_debug_scan(void)
 {
     uint64_t taint = 0;
-    uint64_t int3_timing_taint = 0;
 
-    if (karity_ad_check_being_debugged())        taint |= KARITY_AD_TAINT_BEING_DEBUGGED;
-    if (karity_ad_check_nt_global_flag())         taint |= KARITY_AD_TAINT_NT_GLOBAL_FLAG;
-    if (karity_ad_check_heap_force_flags())       taint |= KARITY_AD_TAINT_HEAP_FORCE_FLAGS;
-    if (karity_ad_check_debug_port())             taint |= KARITY_AD_TAINT_DEBUG_PORT;
-    if (karity_ad_check_debug_flags())            taint |= KARITY_AD_TAINT_DEBUG_FLAGS;
-    if (karity_ad_check_debug_object_handle())    taint |= KARITY_AD_TAINT_DEBUG_OBJECT;
-    if (karity_ad_check_hardware_breakpoints())   taint |= KARITY_AD_TAINT_HW_BREAKPOINT;
-    if (karity_ad_check_closehandle_trap())       taint |= KARITY_AD_TAINT_CLOSEHANDLE_TRAP;
-    if (karity_ad_check_hidden_int3(&int3_timing_taint)) taint |= KARITY_AD_TAINT_HIDDEN_INT3;
-    taint |= int3_timing_taint;
+    if (karity_anti_debug_enabled_categories & KARITY_ANTI_ANALYSIS_DEBUG) {
+        uint64_t int3_timing_taint = 0;
 
-    taint |= karity_anti_vm_scan();
+        if (karity_ad_check_being_debugged())        taint |= KARITY_AD_TAINT_BEING_DEBUGGED;
+        if (karity_ad_check_nt_global_flag())         taint |= KARITY_AD_TAINT_NT_GLOBAL_FLAG;
+        if (karity_ad_check_heap_force_flags())       taint |= KARITY_AD_TAINT_HEAP_FORCE_FLAGS;
+        if (karity_ad_check_debug_port())             taint |= KARITY_AD_TAINT_DEBUG_PORT;
+        if (karity_ad_check_debug_flags())            taint |= KARITY_AD_TAINT_DEBUG_FLAGS;
+        if (karity_ad_check_debug_object_handle())    taint |= KARITY_AD_TAINT_DEBUG_OBJECT;
+        if (karity_ad_check_hardware_breakpoints())   taint |= KARITY_AD_TAINT_HW_BREAKPOINT;
+        if (karity_ad_check_closehandle_trap())       taint |= KARITY_AD_TAINT_CLOSEHANDLE_TRAP;
+        if (karity_ad_check_hidden_int3(&int3_timing_taint)) taint |= KARITY_AD_TAINT_HIDDEN_INT3;
+        taint |= int3_timing_taint;
+    }
+
+    if (karity_anti_debug_enabled_categories & KARITY_ANTI_ANALYSIS_VM) {
+        taint |= karity_anti_vm_scan();
+    }
+
     taint |= karity_anti_sandbox_scan();
 
     return taint;

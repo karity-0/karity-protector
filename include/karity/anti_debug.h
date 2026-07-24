@@ -44,6 +44,23 @@
  * point is raising the cost from "flip one byte" to "fully reverse a
  * multi-technique, watchdog-refreshed value computation before touching
  * anything else."
+ *
+ * anti-debug and anti-VM are opt-in (see KARITY_ANTI_ANALYSIS_DEBUG/_VM and
+ * karity_anti_debug_init below), anti-sandbox is not. This split exists
+ * because their false-positive profiles are genuinely different, not out of
+ * caution for its own sake: a real end user is essentially never "being
+ * debugged", but a substantial and entirely legitimate fraction of real
+ * deployments run *inside a VM* on purpose (cloud desktops, corporate VDI,
+ * Parallels/VMware Fusion, Windows Sandbox, CI) -- unconditionally corrupting
+ * decryption for all of them the moment the hypervisor bit is set would
+ * break the protected program for users who did nothing wrong. This was
+ * empirically confirmed, not just theorized: this project's own build/test
+ * machine turned out to itself be running under a hypervisor the first time
+ * anti-VM detection was tried here (see look/todo.md). anti-sandbox's
+ * heuristics (Sandboxie's injected DLL, unusually low CPU/RAM, a suspiciously
+ * fresh boot, a hooked/skipped Sleep) don't have that same broad legitimate-
+ * use collision, so they stay unconditional like anti-debug's checks
+ * originally shipped.
  */
 #ifndef KARITY_ANTI_DEBUG_H
 #define KARITY_ANTI_DEBUG_H
@@ -54,13 +71,35 @@
 extern "C" {
 #endif
 
-/* Runs every detection technique once, synchronously, and returns their
- * combined contribution: 0 if nothing looked suspicious, nonzero otherwise
- * (the specific nonzero value depends on which technique(s) fired -- it is
- * not itself meaningful, only its zero-ness is checked anywhere, and even
- * that check lives nowhere near this function -- see the file header).
- * Safe to call from a hosted (non-freestanding) build too, e.g. for tests --
- * see runtime/CMakeLists.txt's karity_anti_debug_hosted. */
+/* Bits for karity_anti_debug_init's enabled_categories parameter --
+ * anti-sandbox has no bit here because it's never gated (see the file
+ * header). Shared between src/inject/injector.cpp (which builds this from
+ * --anti-debug/--anti-vm CLI flags at protect time) and
+ * runtime/anti_debug_thunk.S's call-site params (see that file), so the
+ * choice made at protect time reaches the running program without needing
+ * to recompile the freestanding runtime blob per protect run. */
+#define KARITY_ANTI_ANALYSIS_DEBUG 0x1u
+#define KARITY_ANTI_ANALYSIS_VM    0x2u
+
+/* Which categories karity_anti_debug_scan() actually runs -- set once by
+ * karity_anti_debug_init below (from its enabled_categories parameter) and
+ * consulted by every scan after that, including the watchdog's periodic
+ * ones. Exposed directly (rather than only through the init parameter) so
+ * tests/test_anti_debug.c can flip categories on/off without spawning a
+ * real watchdog thread just to do it -- same "poke the real state
+ * directly" testing style already used there for PEB fields. Starts at 0
+ * (BSS): a build that never calls karity_anti_debug_init (most hosted
+ * tests) runs no debug/VM checks and only the always-on sandbox ones. */
+extern uint32_t karity_anti_debug_enabled_categories;
+
+/* Runs every *enabled* detection technique once, synchronously, and
+ * returns their combined contribution: 0 if nothing looked suspicious,
+ * nonzero otherwise (the specific nonzero value depends on which
+ * technique(s) fired -- it is not itself meaningful, only its zero-ness is
+ * checked anywhere, and even that check lives nowhere near this function
+ * -- see the file header). Safe to call from a hosted (non-freestanding)
+ * build too, e.g. for tests -- see runtime/CMakeLists.txt's
+ * karity_anti_debug_hosted. */
 uint64_t karity_anti_debug_scan(void);
 
 /* This process's live taint value -- what runtime/vm_thunk.S actually reads
@@ -77,9 +116,10 @@ uint64_t karity_anti_debug_scan(void);
  * (see e.g. isa.h's vstack_limit note). */
 extern uint64_t karity_anti_debug_taint;
 
-/* Runs the initial scan (updating karity_anti_debug_taint before returning,
- * so even a process that gets killed before the watchdog's first tick is
- * already covered) and spawns the watchdog thread that keeps re-running it
+/* Stores enabled_categories into karity_anti_debug_enabled_categories, runs
+ * the initial scan (updating karity_anti_debug_taint before returning, so
+ * even a process that gets killed before the watchdog's first tick is
+ * already covered), and spawns the watchdog thread that keeps re-running it
  * for the process's lifetime -- a one-time check alone is easy to beat by
  * simply attaching a debugger *after* it already ran once; periodic
  * re-verification closes that TOCTOU gap without needing continuous
@@ -88,8 +128,10 @@ extern uint64_t karity_anti_debug_taint;
  * initial scan still ran and its result is already live -- there's no
  * scratch-buffer/handler dependency chain here the way nanomite's install
  * has, so a partial failure has nothing further to break). Called once, at
- * OEP, by runtime/anti_debug_thunk.S -- see src/inject/injector.cpp. */
-int karity_anti_debug_init(void);
+ * OEP, by runtime/anti_debug_thunk.S with the enabled_categories the
+ * injector baked into that call site's inline params -- see
+ * src/inject/injector.cpp. */
+int karity_anti_debug_init(uint32_t enabled_categories);
 
 #ifdef __cplusplus
 }
