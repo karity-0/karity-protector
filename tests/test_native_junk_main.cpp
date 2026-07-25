@@ -130,6 +130,110 @@ static bool check_overlap_midinsn_desync(std::mt19937_64 &rng)
     return true;
 }
 
+// emit_indirect_jump: push reg (1) + lea reg,[rip+disp] (7) => `jmp reg` (FF /4)
+// at a fixed offset 8. It must be a *register*-indirect jump (mod=11, /4), so a
+// recursive-traversal disassembler has no static target and stops following the
+// flow -- unlike EB/E9 relative jumps it can resync on.
+static bool check_indirect_jump(std::mt19937_64 &rng)
+{
+    std::vector<uint8_t> buf;
+    emit_indirect_jump(buf, rng);
+
+    const size_t jmp = 8;
+    if (buf.size() < jmp + 2 || buf[jmp] != 0xFF) {
+        printf("indirect_jump: FAIL (no FF opcode at offset 8)\n");
+        return false;
+    }
+    uint8_t modrm = buf[jmp + 1];
+    if ((modrm & 0xC0) != 0xC0 || ((modrm >> 3) & 7) != 4) {
+        printf("indirect_jump: FAIL (modrm %02x is not `jmp reg` /4 mod=11)\n", modrm);
+        return false;
+    }
+    ZydisDecoder decoder;
+    ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+    ZydisDecodedInstruction insn;
+    if (!ZYAN_SUCCESS(ZydisDecoderDecodeInstruction(
+            &decoder, nullptr, buf.data() + jmp, buf.size() - jmp, &insn)) ||
+        insn.mnemonic != ZYDIS_MNEMONIC_JMP || insn.length != 2) {
+        printf("indirect_jump: FAIL (not decoded as a 2-byte register jmp)\n");
+        return false;
+    }
+    return true;
+}
+
+// emit_stack_noise: pushfq(1) push(1) mov reg,rsp(3) and(4) add(4) => `sub rsp,
+// reg` at a fixed offset 13. It must be a *register* (variable) rsp adjustment
+// (48 29 modrm, mod=11, rm=4=rsp) -- that non-constant sub rsp is what makes
+// Hex-Rays' sp-analysis fail; a constant `sub rsp, imm` would just fold.
+static bool check_stack_noise(std::mt19937_64 &rng)
+{
+    std::vector<uint8_t> buf;
+    emit_stack_noise(buf, rng);
+
+    const size_t sub = 13;
+    if (buf.size() < sub + 3 || buf[sub] != 0x48 || buf[sub + 1] != 0x29) {
+        printf("stack_noise: FAIL (no `sub r/m64, r64` (48 29) at offset 13)\n");
+        return false;
+    }
+    uint8_t modrm = buf[sub + 2];
+    if ((modrm & 0xC0) != 0xC0 || (modrm & 7) != 4) { // mod=11, rm=100 (rsp)
+        printf("stack_noise: FAIL (sub target is not rsp / not register form, modrm %02x)\n", modrm);
+        return false;
+    }
+    ZydisDecoder decoder;
+    ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+    ZydisDecodedInstruction insn;
+    if (!ZYAN_SUCCESS(ZydisDecoderDecodeInstruction(
+            &decoder, nullptr, buf.data() + sub, buf.size() - sub, &insn)) ||
+        insn.mnemonic != ZYDIS_MNEMONIC_SUB || insn.length != 3) {
+        printf("stack_noise: FAIL (not decoded as a 3-byte reg/reg sub)\n");
+        return false;
+    }
+    return true;
+}
+
+// emit_antistepover_call: E8 rel32(=trap) + <trap bytes> + stub. The stub must
+// rewrite the pushed return address ([rsp+8]) forward past the trap so `ret`
+// lands on the blob continuation, never on the trap region. Verify the exact
+// shape and that the return-address adjustment (imm8) equals trap+9 (= distance
+// from the pushed return addr R to the byte just past the 9-byte stub).
+static bool check_antistepover_call(std::mt19937_64 &rng)
+{
+    std::vector<uint8_t> buf;
+    emit_antistepover_call(buf, rng);
+
+    if (buf.empty() || buf[0] != 0xE8) {
+        printf("antistepover_call: FAIL (no call opcode at offset 0)\n");
+        return false;
+    }
+    uint32_t rel = static_cast<uint32_t>(buf[1]) | (static_cast<uint32_t>(buf[2]) << 8) |
+                   (static_cast<uint32_t>(buf[3]) << 16) | (static_cast<uint32_t>(buf[4]) << 24);
+    size_t trap = rel;                 // stub sits `trap` bytes past the call end
+    size_t stub = 5 + trap;
+    // stub prologue: pushfq + `add qword [rsp+8], imm8` (9C 48 83 44 24 08 ib).
+    static const uint8_t kStub[] = {0x9C, 0x48, 0x83, 0x44, 0x24, 0x08};
+    if (buf.size() != stub + 9) {
+        printf("antistepover_call: FAIL (size %zu != stub_end %zu)\n", buf.size(), stub + 9);
+        return false;
+    }
+    for (size_t i = 0; i < sizeof(kStub); i++) {
+        if (buf[stub + i] != kStub[i]) {
+            printf("antistepover_call: FAIL (stub prologue mismatch at +%zu)\n", i);
+            return false;
+        }
+    }
+    uint8_t imm8 = buf[stub + 6];
+    if (imm8 != trap + 9) {
+        printf("antistepover_call: FAIL (retaddr adjust %u != trap+9=%zu)\n", imm8, trap + 9);
+        return false;
+    }
+    if (buf[stub + 7] != 0x9D || buf[stub + 8] != 0xC3) {
+        printf("antistepover_call: FAIL (no popfq;ret epilogue)\n");
+        return false;
+    }
+    return true;
+}
+
 int main()
 {
     std::mt19937_64 rng(12345);
@@ -165,6 +269,21 @@ int main()
         emit_overlap_midinsn(code, rng);
         if (!run_buffer(code, "overlap_midinsn")) fails++;
     }
+    for (int i = 0; i < 20; i++) {
+        std::vector<uint8_t> code;
+        emit_indirect_jump(code, rng);
+        if (!run_buffer(code, "indirect_jump")) fails++;
+    }
+    for (int i = 0; i < 20; i++) {
+        std::vector<uint8_t> code;
+        emit_stack_noise(code, rng);
+        if (!run_buffer(code, "stack_noise")) fails++;
+    }
+    for (int i = 0; i < 20; i++) {
+        std::vector<uint8_t> code;
+        emit_antistepover_call(code, rng);
+        if (!run_buffer(code, "antistepover_call")) fails++;
+    }
     // combined, multi-round, like the real entry stub will look
     for (int i = 0; i < 10; i++) {
         std::vector<uint8_t> code;
@@ -174,6 +293,9 @@ int main()
         emit_overlap_jump(code, rng);
         emit_overlap_opaque(code, rng);
         emit_overlap_midinsn(code, rng);
+        emit_indirect_jump(code, rng);
+        emit_stack_noise(code, rng);
+        emit_antistepover_call(code, rng);
         emit_native_junk(code, rng);
         if (!run_buffer(code, "combined")) fails++;
     }
@@ -185,9 +307,12 @@ int main()
         if (!check_overlap_jump_desync(rng)) desync_fails++;
         if (!check_overlap_opaque_desync(rng)) desync_fails++;
         if (!check_overlap_midinsn_desync(rng)) desync_fails++;
+        if (!check_indirect_jump(rng)) desync_fails++;
+        if (!check_stack_noise(rng)) desync_fails++;
+        if (!check_antistepover_call(rng)) desync_fails++;
     }
-    if (desync_fails == 0) printf("overlap_desync: PASS (300 checks)\n");
-    else { printf("overlap_desync: %d FAILURES\n", desync_fails); fails += desync_fails; }
+    if (desync_fails == 0) printf("anti_disasm: PASS (600 checks)\n");
+    else { printf("anti_disasm: %d FAILURES\n", desync_fails); fails += desync_fails; }
 
     if (fails == 0) { printf("ALL PASS\n"); return 0; }
     printf("%d FAILURES\n", fails);

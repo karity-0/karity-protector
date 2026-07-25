@@ -8,7 +8,8 @@ namespace karity {
 // Rewrites an AT&T-syntax assembly source (as produced by `gcc -S`) by
 // splicing self-contained no-op junk -- emitted as `.byte` runs from
 // x86_junk.cpp's generators (emit_native_junk / emit_native_opaque_predicate /
-// emit_junk_call / emit_overlap_*) -- between instructions inside executable
+// emit_junk_call / emit_overlap_* / emit_indirect_jump / emit_antistepover_call /
+// emit_stack_noise) -- between instructions inside executable
 // (.text) sections only. The assembler then re-computes every displacement and
 // the linker/nm re-derive every symbol offset, which is why this source-level
 // rewrite is sound where a byte-level splice into the already-linked blob would

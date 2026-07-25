@@ -72,7 +72,7 @@ std::vector<uint8_t> build_native_stub_prefix(std::mt19937_64 &rng)
 {
     std::vector<uint8_t> out;
     std::uniform_int_distribution<int> round_count(8, 20);
-    std::uniform_int_distribution<int> kind(0, 5);
+    std::uniform_int_distribution<int> kind(0, 7);
     int rounds = round_count(rng);
     for (int i = 0; i < rounds; i++) {
         switch (kind(rng)) {
@@ -81,6 +81,8 @@ std::vector<uint8_t> build_native_stub_prefix(std::mt19937_64 &rng)
         case 2: emit_overlap_jump(out, rng); break;
         case 3: emit_overlap_opaque(out, rng); break;
         case 4: emit_overlap_midinsn(out, rng); break;
+        case 5: emit_indirect_jump(out, rng); break;
+        case 6: emit_stack_noise(out, rng); break;
         default: emit_junk_call(out, rng); break;
         }
     }
@@ -97,7 +99,7 @@ std::vector<uint8_t> build_unreachable_trailing_junk(std::mt19937_64 &rng)
 {
     std::vector<uint8_t> out;
     std::uniform_int_distribution<int> round_count(4, 10);
-    std::uniform_int_distribution<int> kind(0, 5);
+    std::uniform_int_distribution<int> kind(0, 7);
     int rounds = round_count(rng);
     for (int i = 0; i < rounds; i++) {
         switch (kind(rng)) {
@@ -106,6 +108,8 @@ std::vector<uint8_t> build_unreachable_trailing_junk(std::mt19937_64 &rng)
         case 2: emit_overlap_jump(out, rng); break;
         case 3: emit_overlap_opaque(out, rng); break;
         case 4: emit_overlap_midinsn(out, rng); break;
+        case 5: emit_indirect_jump(out, rng); break;
+        case 6: emit_stack_noise(out, rng); break;
         default: emit_junk_call(out, rng); break;
         }
     }
@@ -119,7 +123,7 @@ std::vector<uint8_t> build_unreachable_trailing_junk(std::mt19937_64 &rng)
 // of slack, e.g. leftover space at the OEP after the jump into the stub).
 void fill_with_junk_then_nop(std::vector<uint8_t> &out, size_t budget, std::mt19937_64 &rng)
 {
-    std::uniform_int_distribution<int> kind(0, 5);
+    std::uniform_int_distribution<int> kind(0, 7);
     for (;;) {
         std::vector<uint8_t> candidate;
         switch (kind(rng)) {
@@ -128,6 +132,8 @@ void fill_with_junk_then_nop(std::vector<uint8_t> &out, size_t budget, std::mt19
         case 2: emit_overlap_jump(candidate, rng); break;
         case 3: emit_overlap_opaque(candidate, rng); break;
         case 4: emit_overlap_midinsn(candidate, rng); break;
+        case 5: emit_indirect_jump(candidate, rng); break;
+        case 6: emit_stack_noise(candidate, rng); break;
         default: emit_junk_call(candidate, rng); break;
         }
         if (out.size() + candidate.size() > budget) break;

@@ -79,18 +79,21 @@ void append_bytes_directive(std::string &out, const std::vector<uint8_t> &bytes)
 }
 
 // One random junk blob using the same generators the injector uses for its
-// stubs/interpreter (x86_junk.h). All six are strict no-ops; the overlap forms
+// stubs/interpreter (x86_junk.h). All are strict no-ops; the overlap forms
 // additionally desync linear-sweep / recursive-traversal disassemblers, which
 // is exactly the point of pushing them down into the blob's own function bodies.
 void emit_one_junk(std::vector<uint8_t> &bytes, std::mt19937_64 &rng)
 {
-    std::uniform_int_distribution<int> pick(0, 5);
+    std::uniform_int_distribution<int> pick(0, 8);
     switch (pick(rng)) {
     case 0: emit_native_junk(bytes, rng); break;
     case 1: emit_native_opaque_predicate(bytes, rng); break;
     case 2: emit_junk_call(bytes, rng); break;
     case 3: emit_overlap_jump(bytes, rng); break;
     case 4: emit_overlap_opaque(bytes, rng); break;
+    case 5: emit_indirect_jump(bytes, rng); break;
+    case 6: emit_stack_noise(bytes, rng); break;
+    case 7: emit_antistepover_call(bytes, rng); break;
     default: emit_overlap_midinsn(bytes, rng); break;
     }
 }

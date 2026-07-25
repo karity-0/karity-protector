@@ -70,4 +70,55 @@ void emit_overlap_opaque(std::vector<uint8_t> &out, std::mt19937_64 &rng);
 // is meant to be visible in IDA on the entry stub the OEP/--entry jmp lands in.
 void emit_overlap_midinsn(std::vector<uint8_t> &out, std::mt19937_64 &rng);
 
+// Register-indirect control transfer that stops recursive-traversal
+// disassembly (IDA) from following the flow at all -- the complement to the
+// overlap primitives, which make code *look* broken but still let a recursive
+// tool resync on the next known target. Emits `push reg; lea reg, [rip+disp];
+// jmp reg; <decoy>; pop reg`: the `lea` materializes the address of the trailing
+// `pop reg` RIP-relatively (so the displacement is self-contained -- no base
+// relocation, correct under ASLR, position-independent exactly like the overlap
+// decoys), then `jmp reg` transfers there. A recursive disassembler has no
+// static target for `jmp reg`, so it stops decoding past this point and every
+// following byte in the region is left undefined (not just misaligned). The CPU
+// simply lands on `pop reg` and falls through; reg is push/pop-balanced, no flag
+// is touched, RSP is restored -- a strict no-op, verified by
+// tests/test_native_junk_main.cpp executing it. The optional 1-3 byte decoy
+// (jumped over) additionally desyncs a linear sweep, like emit_overlap_jump.
+void emit_indirect_jump(std::vector<uint8_t> &out, std::mt19937_64 &rng);
+
+// Anti-step-over: defeats a debugger's "step over" (x64dbg F8) via return-address
+// manipulation, while staying a strict runtime no-op. Emits `call stub; <trap>;
+// stub: pushfq; add qword [rsp+8], imm8; popfq; ret`. The `call` pushes a return
+// address R pointing at the trap region right after it; the stub then rewrites
+// that saved return address (at [rsp+8], past the 8 bytes pushfq just pushed) to
+// point *past* the trap, so `ret` lands on the blob's real continuation and the
+// trap bytes are never executed on the real path. x64dbg's F8 implements step-over
+// by planting a one-shot breakpoint at R (= call+5) and running the call full
+// speed; because the stub redirects the return away from R, that breakpoint never
+// fires -- step-over silently loses control and runs away instead of stopping
+// after the call. (Note: F8 does not *execute* the trap and fault -- the CPU runs
+// the same real path either way; the trap-byte-execution/desync effect belongs to
+// the emit_overlap_* family. This primitive attacks automatic step-over, not the
+// disassembly boundary.) The trap's first byte is a >= 5-byte decoy lead opcode,
+// so a linear sweep additionally desyncs on it like emit_overlap_jump. call/ret is
+// stack-balanced, the add's flags are pushfq/popfq-saved, no register is touched --
+// a strict no-op, verified by tests/test_native_junk_main.cpp executing it.
+void emit_antistepover_call(std::vector<uint8_t> &out, std::mt19937_64 &rng);
+
+// Defeats the Hex-Rays decompiler's stack-pointer analysis for the enclosing
+// function while staying a strict runtime no-op. Emits `pushfq; push reg;
+// mov reg, rsp; and reg, 0x70; add reg, 0x10; sub rsp, reg; add rsp, reg;
+// pop reg; popfq`. The `sub rsp, reg` is a *variable* (register) stack
+// adjustment, which the decompiler cannot fold to a constant -- it reports
+// "sp-analysis failed" / "positive sp value" and emits broken or refused
+// pseudocode for the whole function. At runtime it's fully balanced: reg is
+// (rsp & 0x70) + 0x10, i.e. a nonzero multiple of 16 in [16,128], so rsp only
+// dips a small, 16-aligned, guard-page-safe amount and is restored by the
+// matching `add rsp, reg` before any real instruction runs (reg is untouched
+// between them, so the pair cancels regardless of its value). Sourcing reg from
+// rsp is what makes it simultaneously bounded/aligned at runtime yet opaque to
+// static analysis. reg is push/pop-balanced and flags are pushfq/popfq-saved,
+// so RAX/RFLAGS/RSP all survive -- verified by tests/test_native_junk_main.cpp.
+void emit_stack_noise(std::vector<uint8_t> &out, std::mt19937_64 &rng);
+
 } // namespace karity

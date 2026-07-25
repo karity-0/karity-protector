@@ -291,4 +291,102 @@ void emit_overlap_midinsn(std::vector<uint8_t> &out, std::mt19937_64 &rng)
     out.push_back(0x9D); // popfq
 }
 
+void emit_indirect_jump(std::vector<uint8_t> &out, std::mt19937_64 &rng)
+{
+    std::uniform_int_distribution<int> reg_dist(0, kRegPoolSize - 1);
+    std::uniform_int_distribution<int> decoy_dist(0, 3);
+    std::uniform_int_distribution<int> lead_dist(0, kDecoyLeadSize - 1);
+    std::uniform_int_distribution<int> byte_dist(0, 255);
+
+    int reg = kRegPool[reg_dist(rng)]; // pool is 0-7, so no REX.R/REX.B needed
+    int decoy = decoy_dist(rng);
+
+    push_reg(out, reg); // save scratch (1 byte)
+
+    // lea reg, [rip + (2 + decoy)] : reg = address of the `pop reg` below.
+    // RIP-relative (mod=00, rm=101), so the displacement is measured from the
+    // end of this lea and is invariant to load address -- no base relocation,
+    // ASLR-safe, position-independent (same property the overlap decoys rely on).
+    out.push_back(0x48);                                     // REX.W
+    out.push_back(0x8D);                                     // lea
+    out.push_back(static_cast<uint8_t>((reg << 3) | 0x05));  // modrm: reg, [rip+disp32]
+    // layout from here: lea ends now; jmp reg (2) + decoy + pop reg. RIP after
+    // lea points at the jmp, so disp = (jmp_len + decoy) = 2 + decoy.
+    uint32_t disp = static_cast<uint32_t>(2 + decoy);
+    emit_u32le(out, disp);
+
+    // jmp reg : register-indirect (FF /4, mod=11). No static target -> a
+    // recursive-traversal disassembler stops following control flow here.
+    out.push_back(0xFF);
+    out.push_back(static_cast<uint8_t>(0xE0 | reg));
+
+    // decoy bytes: never executed (jmp reg lands past them, on pop reg). First
+    // byte a >= 5-byte lead opcode so a linear sweep also desyncs (emit_overlap_jump).
+    if (decoy > 0) {
+        out.push_back(kDecoyLead[lead_dist(rng)]);
+        for (int i = 1; i < decoy; i++) out.push_back(static_cast<uint8_t>(byte_dist(rng)));
+    }
+
+    pop_reg(out, reg); // jmp target: restores scratch. Strict register/flag/stack no-op.
+}
+
+void emit_antistepover_call(std::vector<uint8_t> &out, std::mt19937_64 &rng)
+{
+    std::uniform_int_distribution<int> trap_dist(1, 6);
+    std::uniform_int_distribution<int> lead_dist(0, kDecoyLeadSize - 1);
+    std::uniform_int_distribution<int> byte_dist(0, 255);
+
+    int trap = trap_dist(rng);
+
+    // call rel32 -> stub. The stub sits `trap` bytes past the end of this call
+    // (rel32 is measured from the end of the 5-byte call), so rel32 == trap.
+    out.push_back(0xE8);
+    emit_u32le(out, static_cast<uint32_t>(trap));
+
+    // trap region: the return address the `call` pushed points at its first
+    // byte. Never executed on the real path (the stub redirects the return past
+    // it). First byte is a >= 5-byte decoy lead so a linear sweep also desyncs.
+    out.push_back(kDecoyLead[lead_dist(rng)]);
+    for (int i = 1; i < trap; i++) out.push_back(static_cast<uint8_t>(byte_dist(rng)));
+
+    // stub (9 bytes): rewrite the saved return address to point at the byte just
+    // past this whole blob, then ret there. The stub is 9 bytes long, so the
+    // continuation is at (trap_start=5) + trap + 9 = 14 + trap, i.e. `imm8` past
+    // the pushed return address R=5: imm8 = (14 + trap) - 5 = trap + 9 (<= 15,
+    // safely in a sign-extended byte).
+    out.push_back(0x9C);                                  // pushfq (add sets flags)
+    // add qword [rsp+8], imm8 : [rsp+8] is R (pushfq pushed 8 bytes over it).
+    out.push_back(0x48); out.push_back(0x83);             // REX.W, group-1 imm8
+    out.push_back(0x44); out.push_back(0x24); out.push_back(0x08); // /0, [rsp+disp8], disp8=8
+    out.push_back(static_cast<uint8_t>(trap + 9));        // imm8
+    out.push_back(0x9D);                                  // popfq
+    out.push_back(0xC3);                                  // ret -> blob continuation
+}
+
+void emit_stack_noise(std::vector<uint8_t> &out, std::mt19937_64 &rng)
+{
+    std::uniform_int_distribution<int> reg_dist(0, kRegPoolSize - 1);
+    int reg = kRegPool[reg_dist(rng)]; // pool is 0-7 -> no REX.R/REX.B needed
+
+    out.push_back(0x9C);  // pushfq (the arithmetic below sets flags; restore later)
+    push_reg(out, reg);   // save scratch
+
+    // reg = (rsp & 0x70) + 0x10 : a nonzero multiple of 16 in [0x10, 0x80].
+    // Derived from rsp, so it's provably small/16-aligned at runtime (the rsp
+    // dip below stays tiny and guard-page-safe) yet a decompiler cannot fold it
+    // to a constant.
+    out.push_back(0x48); out.push_back(0x89); out.push_back(modrm11(4, reg));              // mov reg, rsp
+    out.push_back(0x48); out.push_back(0x83); out.push_back(modrm11(4, reg)); out.push_back(0x70); // and reg, 0x70
+    out.push_back(0x48); out.push_back(0x83); out.push_back(modrm11(0, reg)); out.push_back(0x10); // add reg, 0x10
+
+    // sub rsp, reg ; add rsp, reg : runtime-balanced (reg is untouched between,
+    // so it cancels for any value), but the *variable* `sub rsp` makes Hex-Rays'
+    // stack-pointer analysis fail for the whole enclosing function.
+    out.push_back(0x48); out.push_back(0x29); out.push_back(modrm11(reg, 4)); // sub rsp, reg
+    out.push_back(0x48); out.push_back(0x01); out.push_back(modrm11(reg, 4)); // add rsp, reg
+
+    pop_reg(out, reg);    // restore scratch
+    out.push_back(0x9D);  // popfq -- strict register/flag/stack no-op overall
+}
+
 } // namespace karity
