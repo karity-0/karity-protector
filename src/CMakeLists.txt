@@ -10,6 +10,8 @@ add_executable(karity-protector
     native/nanomite_encoder.cpp
     native/nanomite_scan.cpp
     native/seh_unwind.cpp
+    native/asm_obfuscate.cpp
+    native/runtime_rewrite.cpp
     inject/injector.cpp
 )
 

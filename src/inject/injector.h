@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "native/runtime_rewrite.h" // RuntimeBlobLayout
 #include "pe/pe_image.h"
 
 namespace karity {
@@ -75,7 +76,12 @@ namespace karity {
 // default; unlike the anti-analysis categories it has no legitimate-use false
 // positives (the image's own bytes are identical for every user), so it's a
 // safe switch to leave on.
-void inject_vm_at_entry(PeImage &img, const std::vector<uint32_t> &extra_entry_rvas = {}, bool skip_oep = false,
+// `layout` supplies the runtime blob bytes and every symbol offset the injector
+// patches/references -- either default_runtime_layout() (the static embedded
+// blob) or build_obfuscated_runtime() (a freshly recompiled, junk-obfuscated
+// one). See native/runtime_rewrite.h.
+void inject_vm_at_entry(PeImage &img, const RuntimeBlobLayout &layout,
+                        const std::vector<uint32_t> &extra_entry_rvas = {}, bool skip_oep = false,
                         uint32_t anti_analysis_categories = 0, bool anti_tamper = false);
 
 } // namespace karity

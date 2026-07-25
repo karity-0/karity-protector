@@ -34,4 +34,40 @@ void emit_native_opaque_predicate(std::vector<uint8_t> &out, std::mt19937_64 &rn
 // function-boundary analysis rather than just padding straight-line code.
 void emit_junk_call(std::vector<uint8_t> &out, std::mt19937_64 &rng);
 
+// Overlapping / misaligned-instruction anti-disassembly: a short `jmp`
+// forward over a 1-3 byte "decoy" region whose first byte is the opcode of a
+// long (>= 5-byte) instruction (E8 call, E9 jmp, 68 push imm32, B8+ mov
+// imm32, 05/0D/25/2D/3D arith eax,imm32, ...). Execution always lands exactly
+// past the decoy (the jmp target), so the decoy bytes are never executed --
+// but a *linear-sweep* disassembler reading straight through decodes the
+// decoy opcode as its full long form, swallowing the first few bytes of the
+// real (post-decoy) instruction as that decoy's operand. The tool's
+// instruction boundaries thus desynchronize from the CPU's: everything it
+// prints after the decoy is misaligned garbage until it happens to resync.
+// Architecturally a strict no-op (touches nothing -- decoy is pure data the
+// jmp skips), verified by tests/test_native_junk_main.cpp executing it, and
+// its desync effect is verified there against a real Zydis linear decode.
+void emit_overlap_jump(std::vector<uint8_t> &out, std::mt19937_64 &rng);
+
+// Same overlapping-decoy idea, but the skip is an always-taken *conditional*
+// jump (`jnz` past an opaque `(reg|1)&1`, identical to the opaque-predicate
+// carrier), so the decoy region sits in the branch's fall-through. A
+// recursive-traversal disassembler (IDA), unable to prove the predicate
+// constant, must decode that fall-through too -- and desyncs on it exactly
+// like emit_overlap_jump desyncs a linear sweep. Register/flag-safe
+// (pushfq/push ... pop/popfq bracketed like emit_native_opaque_predicate).
+void emit_overlap_opaque(std::vector<uint8_t> &out, std::mt19937_64 &rng);
+
+// The strong form that desyncs recursive traversal (IDA) on the *real*
+// executed path, not just a dead branch. An always-taken `jnz +3` lands three
+// bytes INTO a 5-byte decoy instruction (lead opcode + b1 + b2 + EB 00). A
+// recursive disassembler decodes that decoy whole off the fall-through, so the
+// taken target lands mid-instruction -- the classic "jump into the middle of
+// an instruction" conflict IDA renders as broken/red. Yet the only bytes the
+// CPU actually executes there are the trailing `EB 00` (jmp +0), which just
+// falls through to the `pop reg`/`popfq` epilogue, so it stays a strict
+// register/flag no-op. Unlike emit_overlap_jump (linear-sweep only), this one
+// is meant to be visible in IDA on the entry stub the OEP/--entry jmp lands in.
+void emit_overlap_midinsn(std::vector<uint8_t> &out, std::mt19937_64 &rng);
+
 } // namespace karity

@@ -1,11 +1,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <random>
 #include <string>
 #include <vector>
 
 #include "inject/injector.h"
 #include "karity/anti_debug.h"
+#include "native/runtime_rewrite.h"
 #include "pe/pe_image.h"
 
 int main(int argc, char **argv)
@@ -14,6 +16,7 @@ int main(int argc, char **argv)
         std::fprintf(stderr,
             "usage: %s <input.exe> [-o <output.exe>] [--entry <hex-rva>]... [--no-oep] "
             "[--anti-debug] [--anti-vm] [--anti-sandbox] [--anti-tamper] "
+            "[--obf-runtime] [--mingw-bin <dir>] "
             "[--anti-ida] [--anti-ida-rva <hex-rva>] [--anti-ida-size <hex-size>]\n",
             argv[0]);
         return 2;
@@ -25,6 +28,8 @@ int main(int argc, char **argv)
     bool skip_oep = false;
     uint32_t anti_analysis = 0;
     bool anti_tamper = false;
+    bool obf_runtime = false;
+    std::string mingw_bin;
     bool anti_ida = false;
     bool anti_ida_rva_set = false;
     uint32_t anti_ida_rva = 0;
@@ -73,6 +78,16 @@ int main(int argc, char **argv)
             // startup code whose probe window would otherwise unavoidably
             // overlap a real --entry target's (see inject_vm_at_entry).
             skip_oep = true;
+        } else if (arg == "--obf-runtime") {
+            // Recompile the runtime blob with per-instruction junk this protect
+            // run, so the anti-debug/vm/sandbox scans and other .c-derived blob
+            // functions are no longer plainly readable in IDA (see
+            // native/runtime_rewrite.h). Needs a mingw64 gcc/binutils toolchain
+            // at protect time (--mingw-bin / $KARITY_MINGW_BIN / PATH).
+            obf_runtime = true;
+        } else if (arg == "--mingw-bin" && i + 1 < argc) {
+            // Directory holding gcc/objcopy/nm/objdump for --obf-runtime.
+            mingw_bin = argv[++i];
         } else if (arg == "--anti-ida") {
             // Spoof IMAGE_DIRECTORY_ENTRY_IAT to point at the (post-
             // injection) entry point, tricking IDA into classifying it as
@@ -88,8 +103,17 @@ int main(int argc, char **argv)
     }
 
     try {
+        karity::RuntimeBlobLayout layout;
+        if (obf_runtime) {
+            std::mt19937_64 rng(std::random_device{}());
+            karity::ToolchainPaths tc = karity::resolve_toolchain(mingw_bin);
+            layout = karity::build_obfuscated_runtime(rng, tc);
+        } else {
+            layout = karity::default_runtime_layout();
+        }
+
         auto img = karity::PeImage::load(in_path);
-        karity::inject_vm_at_entry(img, extra_entries, skip_oep, anti_analysis, anti_tamper);
+        karity::inject_vm_at_entry(img, layout, extra_entries, skip_oep, anti_analysis, anti_tamper);
         if (anti_ida) {
             const uint32_t rva = anti_ida_rva_set ? anti_ida_rva : img.entry_point_rva();
             img.spoof_iat_directory(rva, anti_ida_size);

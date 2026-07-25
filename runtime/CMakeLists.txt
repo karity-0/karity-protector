@@ -34,38 +34,35 @@ target_compile_options(karity_runtime_image PRIVATE
     $<$<COMPILE_LANGUAGE:ASM>:-fno-asynchronous-unwind-tables>
 )
 
-target_link_options(karity_runtime_image PRIVATE
+# The exact link args that turn the runtime translation units into the
+# freestanding blob. Held in a variable because two consumers must agree on
+# them byte-for-byte: this target_link_options (the build-time static blob) and
+# the protect-time recompile pipeline (src/native/runtime_rewrite.cpp, which
+# junk-rewrites the runtime .s and re-links it), which gets this same list
+# embedded via GenerateSourceHeader.cmake below.
+#   -Wl,-e,karity_vm_thunk           : custom entry (the blob has no CRT start).
+#   -Wl,-u,karity_vm_native_call     : nothing here calls it (only the later
+#                                      generated interpreter does), so pin it
+#                                      against --gc-sections.
+#   -Wl,-u,karity_*_install_thunk    : likewise reached only by the injector,
+#                                      by offset -- pin all three. Each in turn
+#                                      genuinely calls its karity_*_init, so
+#                                      those (and the taint globals vm_thunk.S
+#                                      references) need no -u of their own.
+set(KARITY_RUNTIME_LINK_FLAGS
     -nostdlib
     -Wl,-e,karity_vm_thunk
-    -Wl,-u,karity_vm_native_call  # nothing in this link calls it (only the
-                                  # generated interpreter, added later, does)
-                                  # -- without this, --gc-sections below
-                                  # would strip it as unreferenced.
-    -Wl,-u,karity_nanomite_install_thunk # nothing in this link calls it
-                                  # either (only the injector, at protect
-                                  # time, jumps to it by offset) -- but it
-                                  # in turn genuinely calls
-                                  # karity_nanomite_install, so that symbol
-                                  # doesn't need its own -u.
-    -Wl,-u,karity_anti_debug_install_thunk # same reasoning as
-                                  # karity_nanomite_install_thunk above --
-                                  # only the injector calls this one, by
-                                  # offset; it in turn genuinely calls
-                                  # karity_anti_debug_init, so that (and the
-                                  # karity_anti_debug_taint global
-                                  # runtime/vm_thunk.S also references
-                                  # directly) don't need their own -u.
-    -Wl,-u,karity_integrity_install_thunk # same reasoning again -- only the
-                                  # injector calls this one, by offset; it in
-                                  # turn genuinely calls karity_integrity_init,
-                                  # so that (and the karity_integrity_taint
-                                  # global runtime/vm_thunk.S references
-                                  # directly) don't need their own -u.
+    -Wl,-u,karity_vm_native_call
+    -Wl,-u,karity_nanomite_install_thunk
+    -Wl,-u,karity_anti_debug_install_thunk
+    -Wl,-u,karity_integrity_install_thunk
     -Wl,--image-base=0x10000000
     -Wl,--file-alignment=16
     -Wl,--section-alignment=16
     -Wl,--gc-sections
 )
+
+target_link_options(karity_runtime_image PRIVATE ${KARITY_RUNTIME_LINK_FLAGS})
 set_target_properties(karity_runtime_image PROPERTIES LINKER_LANGUAGE C)
 
 find_program(KARITY_OBJCOPY objcopy REQUIRED)
@@ -105,8 +102,65 @@ add_custom_command(
 
 add_custom_target(karity_runtime_blob_header DEPENDS "${KARITY_RUNTIME_BLOB_HEADER}")
 
+# --- embed the runtime sources for the protect-time obfuscation pipeline -----
+# The ".c" TUs are pre-compiled to .s at build time (so protect time only has
+# to assemble+link, never run the C frontend) and marked obfuscatable -- the
+# host inserts junk .byte runs between their instructions before re-linking.
+# The hand-written ".S" thunks are embedded verbatim and marked NOT
+# obfuscatable: their prologue shape backs the injector's SEH unwind entries
+# (src/inject/injector.cpp), so they must reassemble byte-for-byte.
+set(KARITY_RUNTIME_C_TUS   api_resolve nanomite_veh anti_debug anti_vm anti_sandbox integrity)
+set(KARITY_RUNTIME_ASM_TUS vm_thunk vm_call nanomite_thunk anti_debug_thunk integrity_thunk)
+
+set(KARITY_RUNTIME_S_FLAGS
+    -ffreestanding -fno-builtin -fno-stack-protector
+    -fno-asynchronous-unwind-tables -fno-ident -O2
+    -I "${CMAKE_SOURCE_DIR}/include")
+
+set(KARITY_ASM_DIR "${KARITY_GENERATED_DIR}/runtime_asm")
+set(KARITY_SOURCE_ENTRIES "")
+
+foreach(tu IN LISTS KARITY_RUNTIME_C_TUS)
+    set(_s "${KARITY_ASM_DIR}/${tu}.s")
+    add_custom_command(
+        OUTPUT "${_s}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${KARITY_ASM_DIR}"
+        COMMAND "${CMAKE_C_COMPILER}" -S ${KARITY_RUNTIME_S_FLAGS}
+                "${CMAKE_CURRENT_SOURCE_DIR}/${tu}.c" -o "${_s}"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${tu}.c"
+        COMMENT "karity: gcc -S ${tu}.c -> ${tu}.s"
+        VERBATIM
+    )
+    list(APPEND KARITY_RUNTIME_S_OUTPUTS "${_s}")
+    list(APPEND KARITY_SOURCE_ENTRIES "${tu}.s|1|${_s}")
+endforeach()
+
+foreach(tu IN LISTS KARITY_RUNTIME_ASM_TUS)
+    # embedded verbatim (self-contained cpp #defines, no #include) -- protect
+    # time writes it back as ".S" so gcc preprocesses+assembles it.
+    list(APPEND KARITY_SOURCE_ENTRIES "${tu}.S|0|${CMAKE_CURRENT_SOURCE_DIR}/${tu}.S")
+    list(APPEND KARITY_RUNTIME_ASM_FILES "${CMAKE_CURRENT_SOURCE_DIR}/${tu}.S")
+endforeach()
+
+set(KARITY_RUNTIME_SOURCES_HEADER "${KARITY_GENERATED_DIR}/runtime_sources.h")
+add_custom_command(
+    OUTPUT "${KARITY_RUNTIME_SOURCES_HEADER}"
+    COMMAND "${CMAKE_COMMAND}" -E make_directory "${KARITY_GENERATED_DIR}"
+    COMMAND "${CMAKE_COMMAND}"
+            -D "OUT_FILE=${KARITY_RUNTIME_SOURCES_HEADER}"
+            -D "SOURCES=${KARITY_SOURCE_ENTRIES}"
+            -D "LINK_FLAGS=${KARITY_RUNTIME_LINK_FLAGS}"
+            -P "${CMAKE_SOURCE_DIR}/cmake/GenerateSourceHeader.cmake"
+    DEPENDS ${KARITY_RUNTIME_S_OUTPUTS}
+            ${KARITY_RUNTIME_ASM_FILES}
+            "${CMAKE_SOURCE_DIR}/cmake/GenerateSourceHeader.cmake"
+    COMMENT "karity: generating runtime_sources.h"
+    VERBATIM
+)
+add_custom_target(karity_runtime_sources_header DEPENDS "${KARITY_RUNTIME_SOURCES_HEADER}")
+
 add_library(karity_runtime_blob INTERFACE)
-add_dependencies(karity_runtime_blob karity_runtime_blob_header)
+add_dependencies(karity_runtime_blob karity_runtime_blob_header karity_runtime_sources_header)
 target_include_directories(karity_runtime_blob INTERFACE "${KARITY_GENERATED_DIR}")
 
 # Hosted (normal, linkable, testable) build of the interpreter core, used by

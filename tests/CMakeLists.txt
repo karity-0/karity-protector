@@ -19,14 +19,27 @@ target_link_libraries(karity_test_vm_branch PRIVATE karity_vm_interp_hosted)
 add_test(NAME vm_branch COMMAND karity_test_vm_branch)
 
 # Executes the generated native junk/opaque-predicate bytes as real machine
-# code (via VirtualAlloc'd RWX memory) and checks they're true no-ops.
+# code (via VirtualAlloc'd RWX memory) and checks they're true no-ops. Also
+# linearly decodes the overlap primitives with Zydis to prove the decoy
+# actually desyncs a disassembler from the real (executed) boundaries.
 add_executable(karity_test_native_junk
     test_native_junk_main.cpp
     test_native_junk_call.S
     ${CMAKE_SOURCE_DIR}/src/native/x86_junk.cpp
 )
 target_include_directories(karity_test_native_junk PRIVATE ${CMAKE_SOURCE_DIR}/src/native)
+target_link_libraries(karity_test_native_junk PRIVATE Zydis)
 add_test(NAME native_junk COMMAND karity_test_native_junk)
+
+# Checks obfuscate_asm() splices junk .byte runs only inside .text sections and
+# preserves the original assembly verbatim around them (src/native/asm_obfuscate.cpp).
+add_executable(karity_test_asm_obfuscate
+    test_asm_obfuscate.cpp
+    ${CMAKE_SOURCE_DIR}/src/native/asm_obfuscate.cpp
+    ${CMAKE_SOURCE_DIR}/src/native/x86_junk.cpp
+)
+target_include_directories(karity_test_asm_obfuscate PRIVATE ${CMAKE_SOURCE_DIR}/src/native)
+add_test(NAME asm_obfuscate COMMAND karity_test_asm_obfuscate)
 
 # Exercises every x64_asm.h encoder by generating tiny snippets, executing
 # them via VirtualAlloc'd RWX memory, and checking real register/memory

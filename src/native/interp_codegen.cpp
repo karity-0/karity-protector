@@ -171,9 +171,12 @@ std::vector<uint8_t> generate_interpreter(uint64_t native_call_rel_to_interp, st
     LabelSpace labels;
 
     auto J = [&]() {
-        switch (std::uniform_int_distribution<int>(0, 2)(rng)) {
+        switch (std::uniform_int_distribution<int>(0, 5)(rng)) {
         case 0: emit_native_junk(code, rng); break;
         case 1: emit_native_opaque_predicate(code, rng); break;
+        case 2: emit_overlap_jump(code, rng); break;
+        case 3: emit_overlap_opaque(code, rng); break;
+        case 4: emit_overlap_midinsn(code, rng); break;
         default: emit_junk_call(code, rng); break;
         }
     };

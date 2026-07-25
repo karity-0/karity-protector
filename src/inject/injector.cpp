@@ -15,12 +15,9 @@
 #include "native/interp_codegen.h"
 #include "native/nanomite_encoder.h"
 #include "native/nanomite_scan.h"
+#include "native/runtime_rewrite.h" // RuntimeBlobLayout (blob bytes + symbol offsets)
 #include "native/seh_unwind.h"
 #include "native/x86_junk.h"
-#include "runtime_blob.h" // generated: karity_runtime_blob[], KARITY_RUNTIME_BLOB_SIZE,
-                          // KARITY_RUNTIME_ENTRY_OFFSET, KARITY_RUNTIME_INTERP_PTR_OFFSET,
-                          // KARITY_RUNTIME_NATIVE_CALL_OFFSET, KARITY_RUNTIME_NANOMITE_THUNK_OFFSET,
-                          // KARITY_RUNTIME_ANTIDEBUG_THUNK_OFFSET
 #include "vm/lifter.h"
 
 namespace karity {
@@ -75,12 +72,15 @@ std::vector<uint8_t> build_native_stub_prefix(std::mt19937_64 &rng)
 {
     std::vector<uint8_t> out;
     std::uniform_int_distribution<int> round_count(8, 20);
-    std::uniform_int_distribution<int> kind(0, 2);
+    std::uniform_int_distribution<int> kind(0, 5);
     int rounds = round_count(rng);
     for (int i = 0; i < rounds; i++) {
         switch (kind(rng)) {
         case 0: emit_native_junk(out, rng); break;
         case 1: emit_native_opaque_predicate(out, rng); break;
+        case 2: emit_overlap_jump(out, rng); break;
+        case 3: emit_overlap_opaque(out, rng); break;
+        case 4: emit_overlap_midinsn(out, rng); break;
         default: emit_junk_call(out, rng); break;
         }
     }
@@ -97,12 +97,15 @@ std::vector<uint8_t> build_unreachable_trailing_junk(std::mt19937_64 &rng)
 {
     std::vector<uint8_t> out;
     std::uniform_int_distribution<int> round_count(4, 10);
-    std::uniform_int_distribution<int> kind(0, 2);
+    std::uniform_int_distribution<int> kind(0, 5);
     int rounds = round_count(rng);
     for (int i = 0; i < rounds; i++) {
         switch (kind(rng)) {
         case 0: emit_native_junk(out, rng); break;
         case 1: emit_native_opaque_predicate(out, rng); break;
+        case 2: emit_overlap_jump(out, rng); break;
+        case 3: emit_overlap_opaque(out, rng); break;
+        case 4: emit_overlap_midinsn(out, rng); break;
         default: emit_junk_call(out, rng); break;
         }
     }
@@ -116,12 +119,15 @@ std::vector<uint8_t> build_unreachable_trailing_junk(std::mt19937_64 &rng)
 // of slack, e.g. leftover space at the OEP after the jump into the stub).
 void fill_with_junk_then_nop(std::vector<uint8_t> &out, size_t budget, std::mt19937_64 &rng)
 {
-    std::uniform_int_distribution<int> kind(0, 2);
+    std::uniform_int_distribution<int> kind(0, 5);
     for (;;) {
         std::vector<uint8_t> candidate;
         switch (kind(rng)) {
         case 0: emit_native_junk(candidate, rng); break;
         case 1: emit_native_opaque_predicate(candidate, rng); break;
+        case 2: emit_overlap_jump(candidate, rng); break;
+        case 3: emit_overlap_opaque(candidate, rng); break;
+        case 4: emit_overlap_midinsn(candidate, rng); break;
         default: emit_junk_call(candidate, rng); break;
         }
         if (out.size() + candidate.size() > budget) break;
@@ -160,7 +166,8 @@ struct Site {
 
 } // namespace
 
-void inject_vm_at_entry(PeImage &img, const std::vector<uint32_t> &extra_entry_rvas, bool skip_oep,
+void inject_vm_at_entry(PeImage &img, const RuntimeBlobLayout &layout,
+                        const std::vector<uint32_t> &extra_entry_rvas, bool skip_oep,
                         uint32_t anti_analysis_categories, bool anti_tamper)
 {
     constexpr size_t kMaxProbe = 256;
@@ -220,12 +227,12 @@ void inject_vm_at_entry(PeImage &img, const std::vector<uint32_t> &extra_entry_r
     const uint32_t predicted_section_rva = img.peek_next_section_rva();
     const uint64_t section_va = img.rva_to_va(predicted_section_rva);
 
-    const uint64_t thunk_va = section_va + KARITY_RUNTIME_ENTRY_OFFSET;
-    const uint64_t native_call_va = section_va + KARITY_RUNTIME_NATIVE_CALL_OFFSET;
-    const uint64_t nanomite_thunk_va = section_va + KARITY_RUNTIME_NANOMITE_THUNK_OFFSET;
-    const uint64_t anti_debug_thunk_va = section_va + KARITY_RUNTIME_ANTIDEBUG_THUNK_OFFSET;
-    const uint64_t integrity_thunk_va = section_va + KARITY_RUNTIME_INTEGRITY_THUNK_OFFSET;
-    const uint32_t stub_offset = align_up(KARITY_RUNTIME_BLOB_SIZE, kSectionAlign);
+    const uint64_t thunk_va = section_va + layout.entry_offset;
+    const uint64_t native_call_va = section_va + layout.native_call_offset;
+    const uint64_t nanomite_thunk_va = section_va + layout.nanomite_thunk_offset;
+    const uint64_t anti_debug_thunk_va = section_va + layout.antidebug_thunk_offset;
+    const uint64_t integrity_thunk_va = section_va + layout.integrity_thunk_offset;
+    const uint32_t stub_offset = align_up(static_cast<uint32_t>(layout.blob.size()), kSectionAlign);
 
     // Self-integrity ("anti-tamper", include/karity/integrity.h) is opt-in via
     // --anti-tamper. When on, an install call (runtime/integrity_thunk.S) is
@@ -396,7 +403,7 @@ void inject_vm_at_entry(PeImage &img, const std::vector<uint32_t> &extra_entry_r
     // [per-site: stub_prefix + call thunk+quad + trailing_junk][interpreter]
     // [per-site bytecode regions][nanomite site table] ---
     std::vector<uint8_t> section;
-    section.insert(section.end(), karity_runtime_blob, karity_runtime_blob + KARITY_RUNTIME_BLOB_SIZE);
+    section.insert(section.end(), layout.blob.begin(), layout.blob.end());
 
     // karity_interp_rel32 (see runtime/vm_thunk.S) has no link-time symbol
     // to resolve against, since the interpreter it calls doesn't exist
@@ -406,11 +413,11 @@ void inject_vm_at_entry(PeImage &img, const std::vector<uint32_t> &extra_entry_r
     // runtime (see vm_thunk.S), even though every direct jmp/call
     // elsewhere in this project has always worked.
     {
-        const uint64_t rel32_operand_va = section_va + KARITY_RUNTIME_INTERP_REL32_OFFSET;
+        const uint64_t rel32_operand_va = section_va + layout.interp_rel32_offset;
         const int32_t rel = static_cast<int32_t>(static_cast<int64_t>(interp_va) -
                                                   static_cast<int64_t>(rel32_operand_va + 4));
         for (int i = 0; i < 4; i++) {
-            section[KARITY_RUNTIME_INTERP_REL32_OFFSET + i] = static_cast<uint8_t>(static_cast<uint32_t>(rel) >> (8 * i));
+            section[layout.interp_rel32_offset + i] = static_cast<uint8_t>(static_cast<uint32_t>(rel) >> (8 * i));
         }
     }
 
@@ -537,23 +544,23 @@ void inject_vm_at_entry(PeImage &img, const std::vector<uint32_t> &extra_entry_r
         // Win64-shadow-space `sub rsp,32` that follow it) needs no unwind
         // code at all, exactly like the generated interpreter's own
         // transient `sub rsp,40`/`add rsp,40` bracket.
-        fns.push_back({predicted_section_rva + KARITY_RUNTIME_ENTRY_OFFSET,
-                        KARITY_RUNTIME_THUNK_END_OFFSET - KARITY_RUNTIME_ENTRY_OFFSET,
+        fns.push_back({predicted_section_rva + layout.entry_offset,
+                        layout.thunk_end_offset - layout.entry_offset,
                         {5} /* RBP, see runtime/vm_thunk.S */,
-                        KARITY_RUNTIME_THUNK_FPREG_OFFSET - KARITY_RUNTIME_ENTRY_OFFSET,
+                        layout.thunk_fpreg_offset - layout.entry_offset,
                         0,
-                        KARITY_RUNTIME_THUNK_FPREG_OFFSET - KARITY_RUNTIME_ENTRY_OFFSET,
+                        layout.thunk_fpreg_offset - layout.entry_offset,
                         5 /* RBP, see runtime/vm_thunk.S */});
         // karity_vm_native_call: no fixed alloc after establishing its frame
         // pointer -- its rsp change (the swap to vreg[RSP]) is an outright
         // overwrite to an unrelated value, not a fixed-size sub, and (like
         // vm_thunk's later dynamic realignment) needs no unwind code either.
-        fns.push_back({predicted_section_rva + KARITY_RUNTIME_NATIVE_CALL_OFFSET,
-                        KARITY_RUNTIME_NATIVE_CALL_END_OFFSET - KARITY_RUNTIME_NATIVE_CALL_OFFSET,
+        fns.push_back({predicted_section_rva + layout.native_call_offset,
+                        layout.native_call_end_offset - layout.native_call_offset,
                         {3, 5, 6, 7} /* RBX, RBP, RSI, RDI push order, see runtime/vm_call.S */,
-                        KARITY_RUNTIME_NATIVE_CALL_PROLOG_END_OFFSET - KARITY_RUNTIME_NATIVE_CALL_OFFSET,
+                        layout.native_call_prolog_end_offset - layout.native_call_offset,
                         0,
-                        KARITY_RUNTIME_NATIVE_CALL_PROLOG_END_OFFSET - KARITY_RUNTIME_NATIVE_CALL_OFFSET,
+                        layout.native_call_prolog_end_offset - layout.native_call_offset,
                         3 /* RBX, see runtime/vm_call.S */});
         // The generated interpreter: its own `sub rsp,40`/`add rsp,40` bracket
         // (VOP_CALL/CALL_IND's align+shadow-space dance around their outbound

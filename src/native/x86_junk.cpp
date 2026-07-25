@@ -53,6 +53,24 @@ void test_reg_self(std::vector<uint8_t> &out, int reg)
     out.push_back(modrm11(reg, reg));
 }
 
+// Opcodes whose full instruction is >= 5 bytes (opcode + 4-byte imm/rel32).
+// Used as the first byte of an overlap decoy: with a 1-3 byte skip, the
+// disassembler reading the decoy as its full long form is forced to swallow
+// bytes from the real instruction that follows -> boundary desync.
+constexpr uint8_t kDecoyLead[] = {
+    0xE8,       // call rel32
+    0xE9,       // jmp  rel32
+    0x68,       // push imm32
+    0x05,       // add  eax, imm32
+    0x0D,       // or   eax, imm32
+    0x25,       // and  eax, imm32
+    0x2D,       // sub  eax, imm32
+    0x3D,       // cmp  eax, imm32
+    0xA9,       // test eax, imm32
+    0xB8, 0xB9, 0xBA, 0xBB, 0xBD, 0xBE, 0xBF, // mov r32, imm32 (skip BC=rsp)
+};
+constexpr int kDecoyLeadSize = static_cast<int>(sizeof(kDecoyLead));
+
 // One register's worth of junk arithmetic: push it, scribble on it with a
 // random chain of ops, pop it back. Whatever ends up in the register when
 // popped is discarded by construction -- the point is the *instructions*,
@@ -169,6 +187,108 @@ void emit_junk_call(std::vector<uint8_t> &out, std::mt19937_64 &rng)
     int32_t call_rel = static_cast<int32_t>(static_cast<int64_t>(sub_start) - static_cast<int64_t>(call_pos + 4));
     uint32_t ucall_rel = static_cast<uint32_t>(call_rel);
     for (int i = 0; i < 4; i++) out[call_pos + i] = static_cast<uint8_t>(ucall_rel >> (8 * i));
+}
+
+namespace {
+
+// Emits `n` decoy bytes: a random long-instruction lead opcode followed by
+// n-1 random filler bytes. These bytes are never executed (a jmp lands right
+// past them); they exist only to be mis-decoded by a linear reader.
+void emit_decoy_bytes(std::vector<uint8_t> &out, int n, std::mt19937_64 &rng)
+{
+    std::uniform_int_distribution<int> lead_dist(0, kDecoyLeadSize - 1);
+    std::uniform_int_distribution<int> byte_dist(0, 255);
+    out.push_back(kDecoyLead[lead_dist(rng)]);
+    for (int i = 1; i < n; i++) out.push_back(static_cast<uint8_t>(byte_dist(rng)));
+}
+
+} // namespace
+
+void emit_overlap_jump(std::vector<uint8_t> &out, std::mt19937_64 &rng)
+{
+    // EB rel8 : jmp forward over `skip` decoy bytes. rel8 is measured from the
+    // end of the 2-byte jmp, so target = decoy_start + skip = the byte right
+    // after the decoy region -> whatever real filler is emitted next. The
+    // decoy's lead opcode (>= 5 bytes long) is only `skip` (1-3) bytes wide
+    // here, so a linear decode of it reaches past the region into the real
+    // stream, desyncing. Touches no register or flag.
+    std::uniform_int_distribution<int> skip_dist(1, 3);
+    int skip = skip_dist(rng);
+    out.push_back(0xEB);
+    out.push_back(static_cast<uint8_t>(skip));
+    emit_decoy_bytes(out, skip, rng);
+}
+
+void emit_overlap_opaque(std::vector<uint8_t> &out, std::mt19937_64 &rng)
+{
+    std::uniform_int_distribution<int> reg_dist(0, kRegPoolSize - 1);
+    std::uniform_int_distribution<int> variant_dist(0, 1);
+    std::uniform_int_distribution<int> skip_dist(1, 3);
+
+    int reg = kRegPool[reg_dist(rng)];
+    int skip = skip_dist(rng);
+
+    out.push_back(0x9C); // pushfq
+    push_reg(out, reg);
+
+    // (carrier | 1) & 1, or (carrier & 1) | 1 -- always 1, so the jnz below
+    // is always taken at runtime regardless of the live value we saved.
+    if (variant_dist(rng) == 0) {
+        arith_reg_imm32(out, 1, reg, 1); // or reg, 1
+        arith_reg_imm32(out, 4, reg, 1); // and reg, 1
+    } else {
+        arith_reg_imm32(out, 4, reg, 1); // and reg, 1
+        arith_reg_imm32(out, 1, reg, 1); // or reg, 1
+    }
+    test_reg_self(out, reg);
+
+    // jnz rel8 = skip : always taken, lands past the decoy on `pop reg`. A
+    // recursive disassembler must still decode the fall-through decoy region,
+    // and desyncs on it. (rel8 measured from end of the 2-byte jnz.)
+    out.push_back(0x75);
+    out.push_back(static_cast<uint8_t>(skip));
+    emit_decoy_bytes(out, skip, rng);
+
+    pop_reg(out, reg); // taken target lands here -> push/pop stay balanced
+    out.push_back(0x9D); // popfq
+}
+
+void emit_overlap_midinsn(std::vector<uint8_t> &out, std::mt19937_64 &rng)
+{
+    std::uniform_int_distribution<int> reg_dist(0, kRegPoolSize - 1);
+    std::uniform_int_distribution<int> variant_dist(0, 1);
+    std::uniform_int_distribution<int> lead_dist(0, kDecoyLeadSize - 1);
+    std::uniform_int_distribution<int> byte_dist(0, 255);
+
+    int reg = kRegPool[reg_dist(rng)];
+
+    out.push_back(0x9C); // pushfq
+    push_reg(out, reg);
+    if (variant_dist(rng) == 0) {
+        arith_reg_imm32(out, 1, reg, 1); // or reg, 1
+        arith_reg_imm32(out, 4, reg, 1); // and reg, 1
+    } else {
+        arith_reg_imm32(out, 4, reg, 1); // and reg, 1
+        arith_reg_imm32(out, 1, reg, 1); // or reg, 1
+    }
+    test_reg_self(out, reg);
+
+    // jnz +3 : always taken (reg is odd -> nonzero). Target is 3 bytes into the
+    // decoy below. The decoy is a fixed 5-byte instruction (lead + b1 + b2 +
+    // EB 00); a recursive disassembler decodes it whole off the never-taken
+    // fall-through, so the taken target sits mid-instruction (IDA: "jump into
+    // the middle of an instruction"). The CPU only ever runs the trailing
+    // EB 00 (jmp +0), which falls straight through to `pop reg`.
+    out.push_back(0x75);
+    out.push_back(0x03);
+    out.push_back(kDecoyLead[lead_dist(rng)]);      // decoy+0 (never executed)
+    out.push_back(static_cast<uint8_t>(byte_dist(rng))); // decoy+1 (never executed)
+    out.push_back(static_cast<uint8_t>(byte_dist(rng))); // decoy+2 (never executed)
+    out.push_back(0xEB);                            // decoy+3 = taken target: jmp +0
+    out.push_back(0x00);                            // decoy+4
+
+    pop_reg(out, reg);   // decoy+5 : where the EB 00 lands
+    out.push_back(0x9D); // popfq
 }
 
 } // namespace karity
